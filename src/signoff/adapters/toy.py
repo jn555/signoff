@@ -218,3 +218,209 @@ class ToyAdapter(ModelAdapter):
 
 def toy(**kwargs) -> ToyAdapter:
     return ToyAdapter(**kwargs)
+
+
+# =========================================================== circuit fixture
+# A SECOND fixture, deliberately not a modification of `ToyAdapter`: the toy
+# above has no attention, and giving it some would move every number the
+# existing tests and the golden report pin.  This one exists so CIRCUIT mode
+# (keep-set of heads + a declared ablation policy) runs on a CPU with no
+# weights, exactly as `ToyAdapter` does that for dictionary substitution.
+
+C_N_LAYERS = 3
+C_N_HEADS = 4
+C_D_HEAD = 4
+C_D_MODEL = C_N_HEADS * C_D_HEAD      # 16
+C_D_MLP = 32
+C_D_VOCAB = 64
+
+
+class _ToyAttn:
+    """Multi-head causal attention with a hookable per-head `z`.
+
+    `z` is (B, T, n_heads, d_head) BEFORE W_O — the same intervention point
+    TransformerLens calls `hook_z`, and the only place one head can be
+    overwritten without touching its neighbours.
+    """
+
+    def __init__(self, layer: int, g: torch.Generator):
+        self.layer = layer
+        s = (C_D_MODEL ** -0.5)
+        self.W_Q = torch.randn(C_N_HEADS, C_D_MODEL, C_D_HEAD, generator=g) * s
+        self.W_K = torch.randn(C_N_HEADS, C_D_MODEL, C_D_HEAD, generator=g) * s
+        self.W_V = torch.randn(C_N_HEADS, C_D_MODEL, C_D_HEAD, generator=g) * s
+        self.W_O = torch.randn(C_N_HEADS, C_D_HEAD, C_D_MODEL, generator=g) * s
+        self.z_state: dict | None = None
+        self.write_fn = None
+
+    def __call__(self, x):
+        # x: (B, T, d_model)
+        q = torch.einsum("btd,hdk->bhtk", x, self.W_Q)
+        k = torch.einsum("btd,hdk->bhtk", x, self.W_K)
+        v = torch.einsum("btd,hdk->bhtk", x, self.W_V)
+        T = x.shape[1]
+        scores = (q @ k.transpose(-1, -2)) / (C_D_HEAD ** 0.5)
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+        z = (scores.softmax(-1) @ v).permute(0, 2, 1, 3)          # (B, T, H, dh)
+        if self.z_state is not None:
+            self.z_state["z"] = z
+        if self.write_fn is not None:
+            z = self.write_fn(z)
+            if self.z_state is not None:
+                self.z_state["z_written"] = z
+        return torch.einsum("bthk,hkd->btd", z, self.W_O)
+
+
+class _ToyCircuitBlock:
+    """attn then MLP, both additive into the residual stream."""
+
+    def __init__(self, layer: int, g: torch.Generator):
+        self.layer = layer
+        self.attn = _ToyAttn(layer, g)
+        self.W_in = torch.randn(C_D_MODEL, C_D_MLP, generator=g) * 0.4
+        self.W_out = torch.randn(C_D_MLP, C_D_MODEL, generator=g) * 0.4
+        self.tap_state: dict | None = None
+        self.replace_fn = None
+
+    @staticmethod
+    def norm(r):
+        return r / r.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def sublayer(self, x):
+        return torch.tanh(x @ self.W_in) @ self.W_out
+
+    def __call__(self, resid):
+        resid = resid + self.attn(self.norm(resid))
+        x = self.norm(resid)
+        y = self.sublayer(x)
+        if self.tap_state is not None:
+            self.tap_state["x"] = x
+            self.tap_state["y"] = y
+        if self.replace_fn is not None:
+            y = self.replace_fn(x, y)
+            if self.tap_state is not None:
+                self.tap_state["yhat"] = y
+        return resid + y
+
+
+class _ToyCircuitModel:
+    def __init__(self, dtype=torch.float32):
+        g = torch.Generator().manual_seed(SEED)
+        self.W_E = torch.randn(C_D_VOCAB, C_D_MODEL, generator=g) * 0.3
+        self.W_pos = torch.randn(64, C_D_MODEL, generator=g) * 0.1
+        self.W_U = torch.randn(C_D_MODEL, C_D_VOCAB, generator=g) * 0.3
+        self.blocks = [_ToyCircuitBlock(L, g) for L in range(C_N_LAYERS)]
+        self.cfg = type("cfg", (), dict(n_layers=C_N_LAYERS, d_model=C_D_MODEL,
+                                        n_heads=C_N_HEADS, d_head=C_D_HEAD,
+                                        d_vocab=C_D_VOCAB))()
+
+    def embed(self, toks):
+        return self.W_E[toks] + self.W_pos[: toks.shape[1]].unsqueeze(0)
+
+    def head(self, resid):
+        return (resid / resid.norm(dim=-1, keepdim=True).clamp_min(1e-6)) @ self.W_U
+
+    def __call__(self, toks, return_type="logits"):
+        resid = self.embed(toks)
+        for b in self.blocks:
+            resid = b(resid)
+        return self.head(resid)
+
+
+class _ToyCircuitHandle:
+    def __init__(self, obj, fields):
+        self.obj, self.fields = obj, fields
+
+    def remove(self):
+        for f in self.fields:
+            setattr(self.obj, f, None)
+
+
+class ToyCircuitAdapter(ModelAdapter):
+    """The contract plus `head_tap` — the fixture CIRCUIT mode is tested on.
+
+    It carries a dictionary too (the same defect model as `ToyAdapter`) so that
+    circuit mode and dictionary mode can be exercised on ONE fixture and shown
+    not to interfere: the whole point of the `SubstitutionPlan` seam is that
+    the runner, the metrics and the gates cannot tell them apart.
+    """
+
+    name = "toy-circuit"
+
+    identity = Identity(
+        release="synthetic-toy-circuit",
+        model_repo="(synthetic)", model_revision="deterministic-seed-0",
+        dict_repo="(synthetic)", dict_revision="deterministic-seed-0",
+        notes="NOT A MODEL. A deterministic fixture with real multi-head attention, so "
+              "circuit mode (per-head keep-set + declared ablation policy) runs with no "
+              "weights and no network.",
+    )
+    taps = TapSpec(
+        input_hook="blocks.{L}.norm_out",
+        output_hook="blocks.{L}.sublayer_out",
+        input_convention="the normalised residual entering the MLP sublayer",
+        output_convention="the MLP sublayer's additive contribution to the residual stream",
+        notes="The per-head tap is `blocks.{L}.attn.z` — (B, T, n_heads, d_head), pre-W_O.",
+    )
+    tokenization = TokenizationSpec(
+        bos_id=None, declared=True, exclude_position_0=True,
+        notes="No BOS; synthetic token ids are uniform over the toy vocabulary.",
+    )
+    dtype_policy = DtypePolicy(
+        default="float32", allowed=("float32",),
+        measured={"float32": "synthetic; gate (iii) is vacuous"},
+    )
+    n_layers = C_N_LAYERS
+    d_model = C_D_MODEL
+    d_vocab = C_D_VOCAB
+    n_heads = C_N_HEADS
+    d_head = C_D_HEAD
+
+    def __init__(self, device: str | None = None, dtype: str | None = None,
+                 defect: float = 0.35):
+        super().__init__(device="cpu", dtype=dtype)
+        self.defect = defect
+
+    def tokenizer(self):
+        raise NotImplementedError(
+            "the toy circuit adapter has no tokenizer: its corpus is synthetic token ids")
+
+    def load_model(self, device, dtype):
+        return _ToyCircuitModel(dtype)
+
+    def load_dictionary(self, layer: int, device, dtype) -> _ToyDictionary:
+        return _ToyDictionary(layer, self.model.blocks[layer],
+                              defect=self.defect * (1.0 + 0.12 * layer))
+
+    def embed(self, model, toks):
+        return model.embed(toks)
+
+    def block(self, model, layer: int, resid):
+        return model.blocks[layer](resid)
+
+    def head(self, model, resid):
+        return model.head(resid).float()
+
+    def tap(self, model, layer: int, replace_fn=None):
+        b = model.blocks[layer]
+        state: dict = {}
+        b.tap_state = state
+        b.replace_fn = replace_fn
+        return state, (_ToyCircuitHandle(b, ("tap_state", "replace_fn")),)
+
+    def head_tap(self, model, layer: int, write_fn=None):
+        a = model.blocks[layer].attn
+        state: dict = {}
+        a.z_state = state
+        a.write_fn = write_fn
+        return state, (_ToyCircuitHandle(a, ("z_state", "write_fn")),)
+
+    def synthetic_corpus(self, n: int = 32, seq_len: int = 16, seed: int = 0,
+                         n_probes: int = 8):
+        return ToyAdapter.synthetic_corpus(self, n=n, seq_len=seq_len, seed=seed,
+                                           n_probes=n_probes)
+
+
+def toy_circuit(**kwargs) -> ToyCircuitAdapter:
+    return ToyCircuitAdapter(**kwargs)

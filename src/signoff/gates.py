@@ -159,6 +159,27 @@ GATE_SPECS: dict[str, GateSpec] = {
                   "declares. Re-mine. If the artifact's own training protocol is unknown, "
                   "that is a provenance problem, not a default to guess at.",
     ),
+    "ablation-provenance": GateSpec(
+        id="ablation-provenance",
+        title="ablation provenance",
+        checks="A CIRCUIT-mode run's ablation values are stamped: a declared policy "
+               "(mean / resample), a declared calibration set, and a digest over the "
+               "actual values that still matches the values on hand.",
+        bug="'Knocked out' is not a value. A circuit's faithfulness number is a function "
+            "of what the ablated components were replaced BY, and Miller et al. "
+            "(2407.08734) measured that choice moving faithfulness a lot — mean-ablation "
+            "and resample-ablation are different checkers, not two spellings of one. A "
+            "mean vector also comes from a calibration set that can drift (different "
+            "templates, seed, size) with nothing in the output saying so.",
+        diagnosis="Recompute the ablation values against the DECLARED calibration set and "
+                  "re-stamp them. If the calibration set genuinely changed, the old "
+                  "faithfulness numbers do not transfer — they were measured against a "
+                  "different checker. Never hand-edit the digest.",
+        # Non-blocking in the shared registry because it is N/A to a dictionary
+        # artifact; `circuit.require_ablation_provenance()` enforces it for
+        # every circuit run, raising the same GateFailure.
+        blocking=False,
+    ),
     "checkpoint-binding": GateSpec(
         id="checkpoint-binding",
         title="checkpoint binding",

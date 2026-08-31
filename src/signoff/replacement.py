@@ -38,15 +38,19 @@ from typing import Any, Iterable, Sequence
 import torch
 
 SUBSTITUTE = "substitute"
+CIRCUIT = "circuit"
 NULL_SHUFFLED = "null:shuffled"
 NULL_TIED = "null:tied-shuffle"
 NULL_GAUSSIAN = "null:gaussian"
 
-MODES = (SUBSTITUTE, NULL_SHUFFLED, NULL_TIED, NULL_GAUSSIAN)
+MODES = (SUBSTITUTE, CIRCUIT, NULL_SHUFFLED, NULL_TIED, NULL_GAUSSIAN)
 
 #: Human-readable, printed in the report so a reader knows what was controlled.
 MODE_DESCRIPTIONS = {
     SUBSTITUTE: "the dictionary's own reconstruction is written into the stream",
+    CIRCUIT: "a claimed CIRCUIT is the replacement: the keep-set of heads/MLPs runs "
+             "intact, everything else is replaced by a declared, stamped ablation "
+             "value, and everything downstream is recomputed (see `circuit.py`)",
     NULL_SHUFFLED: "real errors, permuted independently per layer (marginal preserved "
                    "exactly; input-dependence and cross-layer alignment destroyed)",
     NULL_TIED: "real errors, ONE permutation shared across layers (marginal and "
@@ -68,14 +72,27 @@ class ReplacementSpec:
     mode: str = SUBSTITUTE
     layers: tuple[int, ...] | None = None
     seed: int = 0
+    #: A `circuit.CircuitSpec` when `mode == CIRCUIT`, else None.  Typed loosely
+    #: to keep `circuit.py` (which imports this module) out of the import cycle;
+    #: it is frozen and hashable, so this dataclass stays hashable too.
+    circuit: Any | None = None
 
     def __post_init__(self):
         if self.mode not in MODES:
             raise ValueError(f"unknown replacement mode {self.mode!r}; expected one of {MODES}")
+        if (self.mode == CIRCUIT) != (self.circuit is not None):
+            raise ValueError(
+                "circuit mode and a CircuitSpec go together: mode="
+                f"{self.mode!r} with circuit={'set' if self.circuit is not None else 'None'}. "
+                "A circuit run whose keep-set is not recorded is not auditable.")
 
     @property
     def is_null(self) -> bool:
-        return self.mode != SUBSTITUTE
+        return self.mode.startswith("null:")
+
+    @property
+    def is_circuit(self) -> bool:
+        return self.mode == CIRCUIT
 
     def resolve_layers(self, n_layers: int) -> list[int]:
         if self.layers is None:
@@ -88,11 +105,15 @@ class ReplacementSpec:
     def describe(self, n_layers: int | None = None) -> str:
         n = len(self.layers) if self.layers is not None else n_layers
         where = "all layers" if self.layers is None else f"layers {list(self.layers)}"
-        return f"{self.mode} on {where}" + (f" ({n} replaced)" if n else "")
+        base = f"{self.mode} on {where}" + (f" ({n} replaced)" if n else "")
+        if self.circuit is not None:
+            base += f" [circuit {self.circuit.name}, digest {self.circuit.digest()}]"
+        return base
 
     def to_dict(self) -> dict[str, Any]:
         return dict(mode=self.mode, layers=(list(self.layers) if self.layers else None),
-                    seed=self.seed, description=MODE_DESCRIPTIONS[self.mode])
+                    seed=self.seed, description=MODE_DESCRIPTIONS[self.mode],
+                    circuit=(self.circuit.to_dict() if self.circuit is not None else None))
 
 
 class Replacement:
@@ -104,7 +125,7 @@ class Replacement:
     """
 
     def __init__(self, adapter, layers: Iterable[int] | str | None = "all",
-                 mode: str = SUBSTITUTE, seed: int = 0):
+                 mode: str = SUBSTITUTE, seed: int = 0, circuit: Any | None = None):
         if isinstance(layers, str):
             if layers != "all":
                 raise ValueError("layers must be 'all', None, or an iterable of ints")
@@ -114,6 +135,7 @@ class Replacement:
             mode=mode,
             layers=(None if layers is None else tuple(sorted(set(int(x) for x in layers)))),
             seed=int(seed),
+            circuit=circuit,
         )
 
     @classmethod
@@ -122,6 +144,18 @@ class Replacement:
         """`Replacement.null(ad, "shuffled" | "tied-shuffle" | "gaussian")`."""
         mode = kind if kind.startswith("null:") else f"null:{kind}"
         return cls(adapter, layers=layers, mode=mode, seed=seed)
+
+    @classmethod
+    def circuit(cls, adapter, circuit, seed: int = 0) -> "Replacement":
+        """`Replacement.circuit(ad, IOI_CIRCUIT)` — a claimed circuit as the miter's M̂.
+
+        The substituted layer set is DERIVED from the keep-set (every layer with
+        an ablated head or MLP), so the run tag and the gate fingerprint name the
+        layers actually intervened in rather than a hand-typed list that could
+        drift away from the circuit.
+        """
+        return cls(adapter, layers=circuit.touched_layers(), mode=CIRCUIT, seed=seed,
+                   circuit=circuit)
 
     @property
     def mode(self) -> str:

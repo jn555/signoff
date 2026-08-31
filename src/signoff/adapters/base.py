@@ -196,6 +196,12 @@ REQUIRED_OVERRIDES: tuple[str, ...] = (
     "tokenizer", "load_model", "load_dictionary", "embed", "block", "head", "tap",
 )
 
+#: Supplied only by CIRCUIT-capable adapters (see `circuit.py`).  Same status as
+#: `REQUIRED_OVERRIDES` — no base implementation, so an override carries no
+#: information, but the circuit forward runs through it, so it is named here
+#: rather than left unmentioned.
+OPTIONAL_OVERRIDES: tuple[str, ...] = ("head_tap",)
+
 #: gate id -> the measurement methods whose override makes that gate's verdict
 #: self-reported rather than framework-measured.  The report marks those rows.
 GATE_MEASURED_BY: dict[str, tuple[str, ...]] = {
@@ -206,6 +212,7 @@ GATE_MEASURED_BY: dict[str, tuple[str, ...]] = {
     "identity-guard": ("run_tag",),
     "provenance-freeze": ("verify_provenance", "contract"),
     "bos-declaration": ("gate_bos",),
+    "ablation-provenance": ("substitution_plan", "replaced_logits"),
     "checkpoint-binding": ("contract", "run_tag"),
 }
 
@@ -274,6 +281,10 @@ class ModelAdapter:
     n_layers: int
     d_model: int
     d_vocab: int
+    #: Attention geometry.  Only CIRCUIT-capable adapters need these; a
+    #: dictionary adapter never looks inside the attention sublayer.
+    n_heads: int | None = None
+    d_head: int | None = None
     #: Layers this adapter actually has dictionaries for (default: all).
     dictionary_layers: tuple[int, ...] | None = None
 
@@ -321,6 +332,28 @@ class ModelAdapter:
         """
         raise NotImplementedError
 
+    def head_tap(self, model, layer: int, write_fn: Callable | None = None):
+        """OPTIONAL, for CIRCUIT mode.  A per-ATTENTION-HEAD read/write point.
+
+        `tap()` replaces a whole sublayer, which is the granularity a dictionary
+        claims at.  A circuit claims at the granularity of individual heads
+        inside the attention sublayer, so it needs a separate seam: the
+        per-head output `z`, shaped (B, T, n_heads, d_head), BEFORE it is mixed
+        by W_O.  Writing there is what "knock out head (L, h)" means, and it is
+        the only intervention point at which one head can be changed without
+        touching its neighbours.
+
+        `write_fn(z) -> z_new` gets the whole (B, T, n_heads, d_head) tensor and
+        returns a whole one; the plan owns which head slots it overwrites.  With
+        `write_fn=None` the tap is strictly read-only and records "z" — that is
+        the mode the ablation-value calibration runs in.
+
+        Returns `(state, handles)`; the caller removes the handles.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a per-head tap; circuit mode needs "
+            f"one (see adapters/base.py::head_tap and circuit.py)")
+
     # ------------------------------------------------------------ provided
 
     @property
@@ -352,7 +385,16 @@ class ModelAdapter:
             torch.cuda.empty_cache()
 
     def substitution_plan(self, spec: ReplacementSpec) -> SubstitutionPlan:
-        """THE CROSS-LAYER SEAM.  Override for a CLT-style artifact."""
+        """THE CROSS-LAYER SEAM.  Override for a CLT-style artifact.
+
+        Circuit mode is dispatched here rather than in an adapter override, so
+        ANY adapter that supplies `head_tap()` gets circuit mode for free — the
+        keep-set travels inside the spec, and the plan is chosen from it.
+        """
+        if spec.is_circuit:
+            from ..circuit import CircuitPlan
+
+            return CircuitPlan(spec, self.n_layers, spec.circuit)
         return PerLayerPlan(spec, self.n_layers)
 
     @torch.no_grad()
@@ -521,6 +563,8 @@ class ModelAdapter:
             tokenization=self.tokenization.to_dict(),
             dtype_policy=self.dtype_policy.to_dict(),
             n_layers=self.n_layers, d_model=self.d_model, d_vocab=self.d_vocab,
+            n_heads=self.n_heads, d_head=self.d_head,
+            circuit_capable=(type(self).head_tap is not ModelAdapter.head_tap),
             dictionary_layers=self.available_layers(),
             device=self.device, dtype=self.dtype_name,
             # the delegation stamp; computed by the module-level function so
@@ -540,8 +584,13 @@ class ModelAdapter:
         """
         layers = replacement.layers
         lay = "all" if layers == list(range(self.n_layers)) else ",".join(map(str, layers))
-        return (f"{self.identity.release}:{self.dtype_name}:layers={lay}"
-                f":mode={replacement.mode}:bos={int(self.tokenization.prepend_bos)}")
+        tag = (f"{self.identity.release}:{self.dtype_name}:layers={lay}"
+               f":mode={replacement.mode}:bos={int(self.tokenization.prepend_bos)}")
+        # Two different keep-sets touch the same layers and would otherwise share
+        # a tag; the identity guard would then merge their rows.
+        if replacement.spec.circuit is not None:
+            tag += f":circuit={replacement.spec.circuit.digest()}"
+        return tag
 
     def __repr__(self) -> str:
         return (f"<{type(self).__name__} {self.name} {self.n_layers}L "
@@ -553,7 +602,8 @@ def _rebind(replacement, adapter):
     from ..replacement import Replacement
 
     return Replacement(adapter, layers=replacement.spec.layers,
-                       mode=replacement.spec.mode, seed=replacement.spec.seed)
+                       mode=replacement.spec.mode, seed=replacement.spec.seed,
+                       circuit=replacement.spec.circuit)
 
 
 def pick_device() -> str:

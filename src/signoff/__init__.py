@@ -30,7 +30,13 @@ from .gates import (  # noqa: E402
     GateResult,
     GateSpec,
 )
-from .metrics import SeqMetrics, metrics_from_logits, per_position_kl  # noqa: E402
+from .metrics import (  # noqa: E402
+    SeqMetrics,
+    faithfulness,
+    logit_diff,
+    metrics_from_logits,
+    per_position_kl,
+)
 from .replacement import Replacement, ReplacementSpec  # noqa: E402
 
 __all__ = [
@@ -42,11 +48,14 @@ __all__ = [
     "GateResult",
     "GateSpec",
     "SeqMetrics",
+    "faithfulness",
+    "logit_diff",
     "metrics_from_logits",
     "per_position_kl",
     "Replacement",
     "ReplacementSpec",
     "adapters",
+    "circuit",
     "miners",
     "report",
     "runner",
@@ -61,7 +70,7 @@ def __getattr__(name: str):
     dependencies (datasets, transformer_lens); importing `miter` must stay
     cheap enough for the CPU-only test subset.
     """
-    if name in ("adapters", "miners", "report", "runner", "stats"):
+    if name in ("adapters", "circuit", "miners", "report", "runner", "stats"):
         import importlib
 
         return importlib.import_module(f"{__name__}.{name}")

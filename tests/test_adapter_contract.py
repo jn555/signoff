@@ -28,10 +28,10 @@ from signoff.replacement import (
 
 
 class TestRegistry(unittest.TestCase):
-    def test_lists_the_four_worked_adapters_plus_the_fixture(self):
+    def test_lists_the_worked_adapters_plus_the_fixtures(self):
         self.assertEqual(set(adapters.available()),
-                         {"gpt2-dunefsky", "gemma-scope-2b", "qwen3-mwhanna",
-                          "llama32-clt-mntss", "toy"})
+                         {"gpt2-dunefsky", "gpt2-circuit", "gemma-scope-2b",
+                          "qwen3-mwhanna", "llama32-clt-mntss", "toy", "toy-circuit"})
 
     def test_describe_needs_no_heavy_imports(self):
         d = adapters.describe()

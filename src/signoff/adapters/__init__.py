@@ -33,6 +33,12 @@ _REGISTRY: dict[str, tuple[str, str, str, str]] = {
         "GPT-2-small + Dunefsky/Chlenski MLP transcoders (12 layers, d_sae 24576, float32)",
         "ci",
     ),
+    "gpt2-circuit": (
+        "gpt2_circuit", "gpt2_circuit",
+        "GPT-2-small as a CIRCUIT host — no dictionaries, a per-head z tap, and "
+        "circuit mode (keep-set + declared ablation policy), float32",
+        "ci",
+    ),
     "gemma-scope-2b": (
         "gemma_scope", "gemma_scope_2b",
         "gemma-2-2b + gemma-scope width-16k JumpReLU transcoders (26 layers, float16)",
@@ -55,12 +61,19 @@ _REGISTRY: dict[str, tuple[str, str, str, str]] = {
         "exists so the pipeline, the gates and the report run with no weights.",
         "test",
     ),
+    "toy-circuit": (
+        "toy", "toy_circuit",
+        "SYNTHETIC fixture with real multi-head attention — so CIRCUIT mode (per-head "
+        "keep-set + declared ablation policy) runs with no weights.",
+        "test",
+    ),
 }
 
 __all__ = [
     "ModelAdapter", "Identity", "TapSpec", "TokenizationSpec", "DtypePolicy",
     "Dictionary", "pick_device", "get", "available", "describe",
-    "gpt2_dunefsky", "gemma_scope_2b", "qwen3_mwhanna", "llama32_clt_mntss", "toy",
+    "gpt2_dunefsky", "gpt2_circuit", "gemma_scope_2b", "qwen3_mwhanna",
+    "llama32_clt_mntss", "toy", "toy_circuit",
 ]
 
 

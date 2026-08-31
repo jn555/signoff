@@ -23,7 +23,7 @@ Three conventions are baked in and must not be "cleaned up":
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -134,6 +134,83 @@ def metrics_from_logits(
     # NLL: logits at 0..T-2 predict tokens 1..T-1
     nll = nll_tok.view(B, T)[:, :-1].mean(-1)
     return SeqMetrics(d_mean, d_max, flip, nll)
+
+
+# -------------------------------------------------- task-metric additions
+# NOT extracted from the experiments above: these are the FIELD's own circuit
+# metrics, added so a circuit case study reports in the language its readers
+# already use (logit difference, faithfulness) alongside this tool's (KL, flip).
+# Reference: Wang et al., arXiv:2211.00593 §2 and §4.
+
+
+@torch.no_grad()
+def logit_diff(logits: torch.Tensor, correct: torch.Tensor, wrong: torch.Tensor,
+               at: torch.Tensor | int = -1) -> torch.Tensor:
+    """Per-example `logit[correct] - logit[wrong]` at one position.  Returns (B,).
+
+    logits  : (B, T, V)
+    correct : (B,) token ids of the answer (for IOI, the indirect object)
+    wrong   : (B,) token ids of the distractor (for IOI, the subject)
+    at      : the scored position — an int (negative indexes from the end) or a
+              (B,) LongTensor of per-row end positions, which is what a batch of
+              unequal-length prompts needs.
+
+    Raw logits, NOT log-probabilities: the difference of two logits is invariant
+    to the softmax normaliser, which is exactly why the field uses it, and
+    log-softmaxing first would leave the number unchanged at a cost.  In float32
+    regardless of the model's working dtype.
+    """
+    B, T, V = logits.shape
+    lg = logits.float()
+    if isinstance(at, int):
+        pos = torch.full((B,), at % T, dtype=torch.long, device=lg.device)
+    else:
+        pos = at.to(lg.device, torch.long)
+        if pos.shape != (B,):
+            raise ValueError(f"`at` must be (B,)={B}, got {tuple(pos.shape)}")
+    rows = torch.arange(B, device=lg.device)
+    end = lg[rows, pos]                                   # (B, V)
+    return end.gather(-1, correct.to(lg.device).view(B, 1)).squeeze(-1) - \
+        end.gather(-1, wrong.to(lg.device).view(B, 1)).squeeze(-1)
+
+
+@torch.no_grad()
+def faithfulness(ld_replacement: torch.Tensor, ld_base: torch.Tensor,
+                 *, eps: float = 1e-6) -> dict[str, Any]:
+    """The two faithfulness numbers that are routinely confused for each other.
+
+    ratio_of_means : mean(ld_replacement) / mean(ld_base).  THIS is the paper's
+                     F(C)/F(M) — Wang et al. define F(C) = E_x[logit diff] and
+                     report 87% as the ratio of two expectations (§4).  It is a
+                     single number about the distribution.
+    mean_per_example : mean of ld_replacement(x) / ld_base(x).  This is what
+                     "per-example faithfulness" means, it is the thing a tail
+                     and a witness search are ABOUT, and it is NOT equal to the
+                     ratio of means — Jensen plus a heavy left tail can put
+                     them far apart.  Reporting one as the other is the
+                     commonest way a circuit result gets overstated.
+
+    `per_example` is returned so callers can take quantiles and mine the tail.
+    Rows whose base logit difference is within `eps` of zero have no meaningful
+    ratio (the model does not do the task on them); they are EXCLUDED from
+    `mean_per_example` and counted in `n_degenerate` rather than silently
+    producing a huge number.
+    """
+    a = ld_replacement.detach().float().cpu()
+    b = ld_base.detach().float().cpu()
+    if a.shape != b.shape:
+        raise ValueError(f"shape mismatch: {tuple(a.shape)} vs {tuple(b.shape)}")
+    ok = b.abs() > eps
+    per = torch.full_like(a, float("nan"))
+    per[ok] = a[ok] / b[ok]
+    mb = float(b.mean())
+    return dict(
+        ratio_of_means=(float(a.mean()) / mb if abs(mb) > eps else float("nan")),
+        mean_per_example=(float(per[ok].mean()) if int(ok.sum()) else float("nan")),
+        mean_ld_base=float(b.mean()), mean_ld_replacement=float(a.mean()),
+        n=int(a.numel()), n_degenerate=int((~ok).sum()),
+        per_example=per,
+    )
 
 
 @torch.no_grad()
