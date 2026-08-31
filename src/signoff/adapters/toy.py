@@ -23,6 +23,7 @@ import torch
 from .base import (
     Dictionary,
     DtypePolicy,
+    FreezeCapabilities,
     Identity,
     ModelAdapter,
     TapSpec,
@@ -252,6 +253,13 @@ class _ToyAttn:
         self.W_O = torch.randn(C_N_HEADS, C_D_HEAD, C_D_MODEL, generator=g) * s
         self.z_state: dict | None = None
         self.write_fn = None
+        # the restore/freeze seam (experiment 06).  All None by default, and the
+        # arithmetic below is then byte-for-byte what it was before they existed
+        # — every number the existing tests and the golden report pin is unmoved.
+        self.cap_cache = None
+        self.cap_fires: dict | None = None
+        self.freeze_cache = None
+        self.fires: dict | None = None
 
     def __call__(self, x):
         # x: (B, T, d_model)
@@ -262,7 +270,16 @@ class _ToyAttn:
         scores = (q @ k.transpose(-1, -2)) / (C_D_HEAD ** 0.5)
         mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(mask, float("-inf"))
-        z = (scores.softmax(-1) @ v).permute(0, 2, 1, 3)          # (B, T, H, dh)
+        pattern = scores.softmax(-1)                              # (B, H, T, T)
+        if self.cap_cache is not None:
+            self.cap_cache.attn_pattern[self.layer] = pattern.detach()
+            if self.cap_fires is not None:
+                self.cap_fires["attn_pattern"] = self.cap_fires.get("attn_pattern", 0) + 1
+        if self.freeze_cache is not None:
+            pattern = self.freeze_cache.attn_pattern[self.layer]
+            if self.fires is not None:
+                self.fires["attn_pattern"] = self.fires.get("attn_pattern", 0) + 1
+        z = (pattern @ v).permute(0, 2, 1, 3)                     # (B, T, H, dh)
         if self.z_state is not None:
             self.z_state["z"] = z
         if self.write_fn is not None:
@@ -282,17 +299,36 @@ class _ToyCircuitBlock:
         self.W_out = torch.randn(C_D_MLP, C_D_MODEL, generator=g) * 0.4
         self.tap_state: dict | None = None
         self.replace_fn = None
+        self.cap_cache = None
+        self.cap_fires: dict | None = None
+        self.freeze_cache = None
+        self.fires: dict | None = None
 
-    @staticmethod
-    def norm(r):
-        return r / r.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    def norm(self, r, site: str = "ln1"):
+        """The toy's normalisation, with its DENOMINATOR exposed.
+
+        Freezing normalisation means reusing the clean run's scale, so the scale
+        has to be a value the seam can reach — the same reason TransformerLens
+        fires `hook_scale` before dividing.  With no cache attached this is the
+        expression it always was.
+        """
+        scale = r.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        if self.cap_cache is not None:
+            self.cap_cache.ln_scale[(self.layer, site)] = scale.detach()
+            if self.cap_fires is not None:
+                self.cap_fires[site] = self.cap_fires.get(site, 0) + 1
+        if self.freeze_cache is not None:
+            scale = self.freeze_cache.ln_scale[(self.layer, site)]
+            if self.fires is not None:
+                self.fires[site] = self.fires.get(site, 0) + 1
+        return r / scale
 
     def sublayer(self, x):
         return torch.tanh(x @ self.W_in) @ self.W_out
 
     def __call__(self, resid):
-        resid = resid + self.attn(self.norm(resid))
-        x = self.norm(resid)
+        resid = resid + self.attn(self.norm(resid, "ln1"))
+        x = self.norm(resid, "ln2")
         y = self.sublayer(x)
         if self.tap_state is not None:
             self.tap_state["x"] = x
@@ -314,12 +350,22 @@ class _ToyCircuitModel:
         self.cfg = type("cfg", (), dict(n_layers=C_N_LAYERS, d_model=C_D_MODEL,
                                         n_heads=C_N_HEADS, d_head=C_D_HEAD,
                                         d_vocab=C_D_VOCAB))()
+        self.cap_cache = None
+        self.freeze_cache = None
+        self.fires: dict | None = None
 
     def embed(self, toks):
         return self.W_E[toks] + self.W_pos[: toks.shape[1]].unsqueeze(0)
 
     def head(self, resid):
-        return (resid / resid.norm(dim=-1, keepdim=True).clamp_min(1e-6)) @ self.W_U
+        scale = resid.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        if self.cap_cache is not None:
+            self.cap_cache.final_scale = scale.detach()
+        if self.freeze_cache is not None:
+            scale = self.freeze_cache.final_scale
+            if self.fires is not None:
+                self.fires["final"] = self.fires.get("final", 0) + 1
+        return (resid / scale) @ self.W_U
 
     def __call__(self, toks, return_type="logits"):
         resid = self.embed(toks)
@@ -371,6 +417,17 @@ class ToyCircuitAdapter(ModelAdapter):
         default="float32", allowed=("float32",),
         measured={"float32": "synthetic; gate (iii) is vacuous"},
     )
+    #: Clause 8: this fixture can freeze both, which is what makes the whole
+    #: restore/freeze ladder — and the LRM-identity gate — runnable on a CPU with
+    #: no weights.  Two LN sites, not gemma-2's four: the toy is pre-norm only,
+    #: and declaring sites it does not have would be exactly the lie the
+    #: declaration exists to prevent.
+    freeze_capabilities_spec = FreezeCapabilities(
+        attention=True, ln_sites=("ln1", "ln2", "final"),
+        notes="Synthetic. The pattern is the post-softmax attention matrix and the LN "
+              "scale is the residual's own norm; both are exposed at the point the real "
+              "adapters hook them.",
+    )
     n_layers = C_N_LAYERS
     d_model = C_D_MODEL
     d_vocab = C_D_VOCAB
@@ -415,6 +472,44 @@ class ToyCircuitAdapter(ModelAdapter):
         a.z_state = state
         a.write_fn = write_fn
         return state, (_ToyCircuitHandle(a, ("z_state", "write_fn")),)
+
+    # ------------------------------------------------- restore / freeze seam
+
+    def capture_tap(self, model, layer: int, cache, fires: dict | None = None):
+        b = model.blocks[layer]
+        b.cap_cache = cache
+        b.attn.cap_cache = cache
+        b.cap_fires = fires
+        b.attn.cap_fires = fires
+        return {}, (_ToyCircuitHandle(b, ("cap_cache", "cap_fires")),
+                    _ToyCircuitHandle(b.attn, ("cap_cache", "cap_fires")))
+
+    def freeze_tap(self, model, layer: int, cache, policy, fires: dict | None = None):
+        if not policy.freezes_forward:
+            return ()
+        self._check_freeze_supported(policy)
+        b = model.blocks[layer]
+        handles = []
+        if policy.attention:
+            b.attn.freeze_cache = cache
+            b.attn.fires = fires
+            handles.append(_ToyCircuitHandle(b.attn, ("freeze_cache", "fires")))
+        if policy.layernorm:
+            b.freeze_cache = cache
+            b.fires = fires
+            handles.append(_ToyCircuitHandle(b, ("freeze_cache", "fires")))
+        return tuple(handles)
+
+    def final_norm_tap(self, model, cache, freeze: bool = False, fires: dict | None = None):
+        if freeze:
+            if cache.final_scale is None:
+                raise KeyError("no clean final-norm scale cached; capture it around the "
+                               "CLEAN head first")
+            model.freeze_cache = cache
+            model.fires = fires
+        else:
+            model.cap_cache = cache
+        return (_ToyCircuitHandle(model, ("cap_cache", "freeze_cache", "fires")),)
 
     def synthetic_corpus(self, n: int = 32, seq_len: int = 16, seed: int = 0,
                          n_probes: int = 8):

@@ -62,7 +62,14 @@ import torch
 from .. import gates as G
 from .. import metrics as M
 from .. import stats as S
-from ..replacement import PerLayerPlan, ReplacementSpec, Site, SubstitutionPlan
+from ..replacement import (
+    LN_SITES,
+    FreezePolicy,
+    PerLayerPlan,
+    ReplacementSpec,
+    Site,
+    SubstitutionPlan,
+)
 
 
 # ------------------------------------------------------------- declarations
@@ -127,6 +134,46 @@ class TokenizationSpec:
     def to_dict(self) -> dict[str, Any]:
         return dict(bos_id=self.bos_id, prepend_bos=self.prepend_bos,
                     declared=self.declared, exclude_position_0=self.exclude_position_0,
+                    notes=self.notes)
+
+
+@dataclass(frozen=True)
+class FreezeCapabilities:
+    """What of the real forward this adapter can RESTORE from a clean run.
+
+    DECLARED, like every other clause, because there is no safe default: an
+    adapter that cannot reach its attention pattern must say so and be refused a
+    frozen run, not quietly hand back a recomputed one under the frozen name.
+    An empty capability set is a legitimate declaration — error nodes need no
+    hooks beyond the ordinary write site, so an adapter with no attention at all
+    still supports the error-node rung.
+    """
+
+    attention: bool = False
+    #: which of `replacement.LN_SITES` this adapter can freeze
+    ln_sites: tuple[str, ...] = ()
+    notes: str = ""
+
+    def __post_init__(self):
+        bad = [s for s in self.ln_sites if s not in LN_SITES]
+        if bad:
+            raise ValueError(f"unknown LN freeze sites {bad}; expected from {LN_SITES}")
+
+    @property
+    def block_ln_sites(self) -> tuple[str, ...]:
+        """The per-block sites; `final` is captured at head time, not in a block."""
+        return tuple(s for s in self.ln_sites if s != "final")
+
+    @property
+    def layernorm(self) -> bool:
+        return bool(self.ln_sites)
+
+    def supports(self, policy: FreezePolicy) -> bool:
+        return ((self.attention or not policy.attention)
+                and (self.layernorm or not policy.layernorm))
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(attention=self.attention, ln_sites=list(self.ln_sites),
                     notes=self.notes)
 
 
@@ -200,7 +247,12 @@ REQUIRED_OVERRIDES: tuple[str, ...] = (
 #: `REQUIRED_OVERRIDES` — no base implementation, so an override carries no
 #: information, but the circuit forward runs through it, so it is named here
 #: rather than left unmentioned.
-OPTIONAL_OVERRIDES: tuple[str, ...] = ("head_tap",)
+#: Same status as `REQUIRED_OVERRIDES`: no base implementation worth the name, so
+#: an override carries no information, but the frozen forward runs through them.
+#: `head_tap` is CIRCUIT mode's seam; the other three are the RESTORE/FREEZE seam
+#: a local replacement model needs (experiment 06).
+OPTIONAL_OVERRIDES: tuple[str, ...] = ("head_tap", "capture_tap", "freeze_tap",
+                                       "final_norm_tap")
 
 #: gate id -> the measurement methods whose override makes that gate's verdict
 #: self-reported rather than framework-measured.  The report marks those rows.
@@ -214,6 +266,8 @@ GATE_MEASURED_BY: dict[str, tuple[str, ...]] = {
     "bos-declaration": ("gate_bos",),
     "ablation-provenance": ("substitution_plan", "replaced_logits"),
     "checkpoint-binding": ("contract", "run_tag"),
+    "lrm-base-identity": ("base_logits", "replaced_logits", "substitution_plan"),
+    "freeze-efficacy": ("replaced_logits", "substitution_plan"),
 }
 
 
@@ -353,6 +407,87 @@ class ModelAdapter:
         raise NotImplementedError(
             f"{type(self).__name__} does not expose a per-head tap; circuit mode needs "
             f"one (see adapters/base.py::head_tap and circuit.py)")
+
+    # -------------------------------------------------- restore / freeze seam
+    # The hooks a LOCAL REPLACEMENT MODEL needs beyond an ordinary substitution:
+    # read the clean run's attention patterns and normalisation scales, then
+    # write them back on a corrupted stream.  Hook NAMES are artifact-specific
+    # (and gemma-2's sandwich norm has four per block where GPT-2 has two), so
+    # this is adapter territory; the policy and the cache are not.
+
+    #: Clause 8, by the same logic as clauses 1-7: declared, then refused when
+    #: a run asks for more than the declaration.  Default: nothing freezable.
+    freeze_capabilities_spec: FreezeCapabilities = FreezeCapabilities()
+
+    def freeze_capabilities(self) -> FreezeCapabilities:
+        return self.freeze_capabilities_spec
+
+    def ln_sites_for(self, layer: int) -> tuple[str, ...]:
+        """The per-block LN sites frozen at `layer`.  Uniform by default."""
+        return self.freeze_capabilities().block_ln_sites
+
+    def _check_freeze_supported(self, policy: FreezePolicy) -> FreezeCapabilities:
+        caps = self.freeze_capabilities()
+        if not caps.supports(policy):
+            want = [n for n, v in (("attention", policy.attention),
+                                   ("layernorm", policy.layernorm)) if v]
+            raise NotImplementedError(
+                f"{type(self).__name__} declares freeze capabilities {caps.to_dict()} and "
+                f"cannot freeze {want}. A frozen run on an adapter that cannot freeze is "
+                f"a RECOMPUTED run wearing the wrong name — implement `capture_tap` / "
+                f"`freeze_tap` and declare them, or run the policy this adapter supports.")
+        return caps
+
+    def capture_tap(self, model, layer: int, cache, fires: dict | None = None):
+        """Read-only: record `layer`'s clean attention pattern and LN scales.
+
+        Returns `(state, handles)` like `tap()`; the caller removes the handles.
+        Writes straight into `cache` (a `replacement.CleanRunCache`) so a
+        layer-major pass can capture and free one layer at a time.
+
+        `fires` (optional) counts how many times each site was invoked. That
+        count is the STRUCTURAL fact a freeze-efficacy check needs: a norm is not
+        necessarily called once per block (TransformerLens calls `ln1` three
+        times on a pre-norm block, once each for the query, key and value
+        inputs), so the only honest expectation for the frozen forward is the
+        one the clean forward just measured on the same architecture.
+        """
+        if self.freeze_capabilities().attention or self.freeze_capabilities().ln_sites:
+            raise NotImplementedError(
+                f"{type(self).__name__} declares freeze capabilities but does not "
+                f"implement `capture_tap`")
+        return {}, ()
+
+    def freeze_tap(self, model, layer: int, cache, policy: FreezePolicy):
+        """Write the cached clean values back during a forward on this layer.
+
+        Returns handles only (there is nothing to read back).  The base class
+        supports exactly one policy — one that freezes nothing.
+        """
+        if not policy.freezes_forward:
+            return ()
+        self._check_freeze_supported(policy)
+        raise NotImplementedError(
+            f"{type(self).__name__} declares freeze capabilities but does not "
+            f"implement `freeze_tap`")
+
+    def final_norm_tap(self, model, cache, freeze: bool = False):
+        """Capture (or restore) the FINAL norm's scale, around the head.
+
+        Separate from `capture_tap` because the last normalisation happens at
+        head time, not inside a block — and it is the one that decides how a
+        corrupted final residual is scaled before the unembed, so a frozen run
+        that forgets it is not fully frozen.
+        """
+        if "final" not in self.freeze_capabilities().ln_sites:
+            if freeze:
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not declare the final norm as freezable, "
+                    f"so a layernorm-freezing run cannot be completed through its head")
+            return ()
+        raise NotImplementedError(
+            f"{type(self).__name__} declares the final norm freezable but does not "
+            f"implement `final_norm_tap`")
 
     # ------------------------------------------------------------ provided
 
@@ -565,6 +700,7 @@ class ModelAdapter:
             n_layers=self.n_layers, d_model=self.d_model, d_vocab=self.d_vocab,
             n_heads=self.n_heads, d_head=self.d_head,
             circuit_capable=(type(self).head_tap is not ModelAdapter.head_tap),
+            freeze_capabilities=self.freeze_capabilities().to_dict(),
             dictionary_layers=self.available_layers(),
             device=self.device, dtype=self.dtype_name,
             # the delegation stamp; computed by the module-level function so
@@ -590,6 +726,14 @@ class ModelAdapter:
         # a tag; the identity guard would then merge their rows.
         if replacement.spec.circuit is not None:
             tag += f":circuit={replacement.spec.circuit.digest()}"
+        # POLICY PROVENANCE.  The four rungs of experiment 06's ladder replace the
+        # same layers with the same dictionaries in the same dtype and differ ONLY
+        # in what they restore — so without this they would share a run tag, and
+        # the identity guard would happily merge a skeleton's rows into a local
+        # replacement model's.  Appended only when something is restored, so every
+        # tag written before this existed still means what it said.
+        if replacement.spec.freeze.restores_anything:
+            tag += f":freeze={replacement.spec.freeze.tag()}"
         return tag
 
     def __repr__(self) -> str:
@@ -603,7 +747,7 @@ def _rebind(replacement, adapter):
 
     return Replacement(adapter, layers=replacement.spec.layers,
                        mode=replacement.spec.mode, seed=replacement.spec.seed,
-                       circuit=replacement.spec.circuit)
+                       circuit=replacement.spec.circuit, freeze=replacement.spec.freeze)
 
 
 def pick_device() -> str:

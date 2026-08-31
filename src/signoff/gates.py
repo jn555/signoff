@@ -180,6 +180,66 @@ GATE_SPECS: dict[str, GateSpec] = {
         # every circuit run, raising the same GateFailure.
         blocking=False,
     ),
+    "lrm-base-identity": GateSpec(
+        id="lrm-base-identity",
+        title="LRM ≡ base identity",
+        checks="A LOCAL REPLACEMENT MODEL — transcoders everywhere, error nodes restored, "
+               "attention patterns and normalisation scales frozen from the real forward — "
+               "reproduces the base model's logits on its own prompt, to within the "
+               "working dtype's own base-vs-base floor.",
+        bug="Experiment 05 reported that the transcoder skeleton loses a multi-hop answer "
+            "(p 0.41 -> 7e-6) and could only attribute the gap to {error nodes + frozen "
+            "attention + frozen LN} JOINTLY, because it had never built the object "
+            "attribution graphs are actually drawn on. Building it in experiment 06 made "
+            "the decomposition possible — and made this identity the thing that says the "
+            "object was built correctly. It is not a measurement: the LRM reproduces the "
+            "model BY CONSTRUCTION, since `TC(x_clean) + (y_clean - TC(x_clean)) == "
+            "y_clean` pins the stream to the clean trajectory at every layer. A non-zero "
+            "value here means the construction is wrong, and every decomposition taken "
+            "on top of it is a number about the wrong object.",
+        diagnosis="The construction is wrong; do NOT read the decomposition. In order of "
+                  "how often each was the cause: (a) the error nodes were formed or added "
+                  "in the working dtype instead of float32, so each layer leaks an ulp and "
+                  "the leak compounds with depth — the tell is a residual that grows "
+                  "monotonically with the number of replaced layers; (b) the error node "
+                  "was computed against a DIFFERENT input than the dictionary is fed at "
+                  "the write site (clean cache built at one tap, substitution written at "
+                  "another); (c) the cache is a different batch's — check the tokens "
+                  "digest; (d) the frozen pattern or scale was written with the wrong "
+                  "shape or head order, which a frozen-vs-clean control isolates in one "
+                  "run. Note what this gate CANNOT see: the identity is achieved by the "
+                  "error nodes alone, so a freeze that silently did nothing still passes. "
+                  "Pair it with `check_freeze_efficacy`.",
+        # Non-blocking in the shared registry for exactly `ablation-provenance`'s
+        # reason: it is N/A to a run that restores nothing, and a permanently
+        # UNRUN blocking gate would make `require()` meaningless for every
+        # ordinary substitution run.  A run that CLAIMS to be a local
+        # replacement model demands it with `replacement.require_lrm_identity()`,
+        # which raises the same GateFailure.
+        blocking=False,
+    ),
+    "freeze-efficacy": GateSpec(
+        id="freeze-efficacy",
+        title="freeze efficacy",
+        checks="A run that claims to freeze attention or normalisation actually DIFFERS "
+               "from the same substitution with those recomputed, and the freeze hooks "
+               "fired the expected number of times.",
+        bug="The positive control the LRM identity gate cannot be. Freezing is done by "
+            "returning a cached tensor from a forward hook on a library's internal hook "
+            "point; if the hook name moves, or the library stops routing that value "
+            "through it, the hook still registers and still fires and simply has no "
+            "effect. Every downstream number would then be labelled 'frozen' and be the "
+            "recomputed run — and the LRM gate would still pass, because error nodes "
+            "alone reproduce the base model.",
+        diagnosis="The freeze is a no-op. Check that the hooked value is USED downstream "
+                  "of the hook in the installed library version (in TransformerLens, "
+                  "`hook_pattern`'s and `hook_scale`'s outputs are consumed by the very "
+                  "next line — that is what makes them patchable), that the handles were "
+                  "not removed before the forward, and that the fire counts match the "
+                  "number of blocks the pass ran. Zero fires means the hook is on a module "
+                  "the forward never reaches.",
+        blocking=False,
+    ),
     "checkpoint-binding": GateSpec(
         id="checkpoint-binding",
         title="checkpoint binding",
@@ -630,6 +690,120 @@ def check_checkpoint_binding(
         spec, PASS, 0.0, None,
         f"gate verdicts are bound to this configuration ({expected_hash})"
         + (" and were restored from a checkpoint" if restored else ""), detail)
+
+
+#: The gate ids of the restore/freeze pair, so callers name them once.
+LRM_IDENTITY_GATE = "lrm-base-identity"
+FREEZE_EFFICACY_GATE = "freeze-efficacy"
+
+#: How much slack the LRM identity gets over the SAME dtype's base-vs-base floor.
+#: The construction is exact in exact arithmetic, so the only honest reference
+#: is the floor the dtype already imposes on reproducing the model at all
+#: (gate (i)); this is a factor, not an absolute, because "fp16 tolerance" means
+#: nothing until something says what fp16 costs on this model.
+LRM_IDENTITY_FLOOR_FACTOR = 10.0
+
+
+def check_lrm_base_identity(
+    kl_max: float, *, max_abs_logit_diff: float | None = None,
+    base_vs_base_kl_max: float | None = None, dtype: str = "float16",
+    n_layers_replaced: int | None = None, all_finite: bool = True,
+    identity_residual: float | None = None, tolerance: float | None = None,
+) -> GateResult:
+    """The local replacement model must BE the base model on its own prompt.
+
+    `kl_max` is max per-position KL between the base model's own forward and the
+    LRM's.  `base_vs_base_kl_max` is gate (i)'s floor measured on the SAME
+    tokens: the LRM path runs through the hand-rolled layer-major forward and
+    the hand-rolled head, so it inherits that floor and cannot be asked to beat
+    it.  The tolerance is therefore `max(dtype floor, factor x measured floor)`
+    unless a caller overrides it.
+
+    `identity_residual` is the sharper, optional number: max |logit diff| between
+    the LRM and the CLEAN LAYER-MAJOR pass, which shares every source of dtype
+    error with it. Computed in float32 that residual is bitwise ZERO, so a
+    non-zero value localises the bug to the construction rather than to the
+    dtype — which is why it is reported separately instead of being folded in.
+    """
+    spec = GATE_SPECS[LRM_IDENTITY_GATE]
+    floor = BASE_VS_BASE_TOL.get(dtype, 1e-4)
+    if tolerance is None:
+        tol = floor if base_vs_base_kl_max is None else max(
+            floor, LRM_IDENTITY_FLOOR_FACTOR * float(base_vs_base_kl_max))
+    else:
+        tol = float(tolerance)
+    detail = dict(dtype=dtype, all_finite=bool(all_finite),
+                  max_abs_logit_diff=max_abs_logit_diff,
+                  base_vs_base_kl_max=base_vs_base_kl_max,
+                  dtype_floor=floor, identity_residual=identity_residual,
+                  n_layers_replaced=n_layers_replaced)
+    if not all_finite:
+        return GateResult(spec, FAIL, kl_max, tol,
+                          "non-finite logits from the local replacement model — an "
+                          "overflow, not a construction error", detail)
+    ok = float(kl_max) < tol
+    where = ("" if n_layers_replaced is None
+             else f" across {n_layers_replaced} replaced layers")
+    if ok:
+        msg = (f"the local replacement model reproduces the base model{where} "
+               f"(KL max {kl_max:.3e} < {tol:.1e})")
+        if identity_residual is not None:
+            msg += (f"; identity residual vs the clean layer-major pass "
+                    f"{identity_residual:.3e}")
+        return GateResult(spec, PASS, float(kl_max), tol, msg, detail)
+    return GateResult(
+        spec, FAIL, float(kl_max), tol,
+        f"the local replacement model does NOT reproduce the base model{where}: KL max "
+        f"{kl_max:.3e} >= tolerance {tol:.1e}"
+        + ("" if base_vs_base_kl_max is None
+           else f" (the dtype's own base-vs-base floor here is {base_vs_base_kl_max:.3e})")
+        + ". The construction is wrong; the decomposition above it is about a different "
+          "object", detail)
+
+
+def check_freeze_efficacy(
+    frozen_vs_recomputed: float, *, hook_fires: Mapping[str, int] | None = None,
+    expected_fires: Mapping[str, int] | None = None,
+    min_difference: float = 0.0,
+) -> GateResult:
+    """The positive control: a frozen run must actually differ from a recomputed one.
+
+    `frozen_vs_recomputed` is any non-negative divergence between the SAME
+    substitution run with and without freezing — max |logit diff| is what the
+    experiment uses.  Exactly zero means the freeze changed nothing, which for a
+    substituted (already-diverged) stream can only mean the hooks did not bind.
+
+    `hook_fires` / `expected_fires` catch the same failure one step earlier, and
+    catch it even when a coincidence makes the difference non-zero.
+    """
+    spec = GATE_SPECS[FREEZE_EFFICACY_GATE]
+    detail = dict(frozen_vs_recomputed=float(frozen_vs_recomputed),
+                  hook_fires=(dict(hook_fires) if hook_fires else None),
+                  expected_fires=(dict(expected_fires) if expected_fires else None))
+    if hook_fires is not None and expected_fires is not None:
+        wrong = {k: (hook_fires.get(k, 0), v) for k, v in expected_fires.items()
+                 if hook_fires.get(k, 0) != v}
+        if wrong:
+            return GateResult(
+                spec, FAIL, float(frozen_vs_recomputed), None,
+                "freeze hooks did not fire as expected (site: got vs expected) "
+                + ", ".join(f"{k}: {g} vs {e}" for k, (g, e) in sorted(wrong.items()))
+                + " — the run is labelled frozen and is not", detail)
+    if not (float(frozen_vs_recomputed) > float(min_difference)):
+        return GateResult(
+            spec, FAIL, float(frozen_vs_recomputed), min_difference,
+            f"freezing changed nothing (frozen vs recomputed = "
+            f"{float(frozen_vs_recomputed):.3e}): on a substituted stream the frozen and "
+            f"recomputed values genuinely differ, so identical outputs mean the freeze "
+            f"hooks are a no-op", detail)
+    return GateResult(
+        spec, PASS, float(frozen_vs_recomputed), min_difference,
+        f"freezing measurably changes the substituted forward "
+        f"(max |logit diff| vs recomputed {float(frozen_vs_recomputed):.3e})"
+        + ("" if not hook_fires else
+           f"; hooks fired {sum(hook_fires.values())} times across "
+           f"{len(hook_fires)} sites"),
+        detail)
 
 
 def summary_table(report: GateReport) -> str:

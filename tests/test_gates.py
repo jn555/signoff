@@ -29,19 +29,22 @@ class TestGateCatalogue(unittest.TestCase):
             set(G.GATE_SPECS),
             {"i-base-vs-base", "ii-fvu-sanity", "iii-fp32-replay",
              "iii-prime-paired-bound", "identity-guard", "provenance-freeze",
-             "bos-declaration", "ablation-provenance", "checkpoint-binding"},
+             "bos-declaration", "ablation-provenance", "checkpoint-binding",
+             "lrm-base-identity", "freeze-efficacy"},
         )
 
-    def test_the_only_non_blocking_gates_are_the_two_mode_specific_ones(self):
+    def test_the_only_non_blocking_gates_are_the_mode_specific_ones(self):
         # (iii') is a FALLBACK — it only matters once (iii) has failed.
-        # ablation-provenance is MODE-SPECIFIC — it is N/A to a dictionary
-        # artifact, and a permanently-UNRUN blocking gate would make
-        # `require()` meaningless for four of the five adapters.  Circuit runs
-        # enforce it with `circuit.require_ablation_provenance()`, which raises
-        # the same GateFailure; see test_circuit.py.
+        # The other three are MODE-SPECIFIC — N/A to a plain dictionary
+        # substitution, and a permanently-UNRUN blocking gate would make
+        # `require()` meaningless for every adapter.  The modes that DO need
+        # them demand them explicitly and raise the same GateFailure:
+        # `circuit.require_ablation_provenance()` and
+        # `replacement.require_lrm_identity()`.
         non_blocking = [g for g, s in G.GATE_SPECS.items() if not s.blocking]
         self.assertEqual(sorted(non_blocking),
-                         ["ablation-provenance", "iii-prime-paired-bound"])
+                         ["ablation-provenance", "freeze-efficacy",
+                          "iii-prime-paired-bound", "lrm-base-identity"])
 
 
 class TestBaseVsBase(unittest.TestCase):

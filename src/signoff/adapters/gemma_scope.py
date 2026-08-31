@@ -79,12 +79,14 @@ import torch
 from .base import (
     Dictionary,
     DtypePolicy,
+    FreezeCapabilities,
     Identity,
     ModelAdapter,
     TapSpec,
     TokenizationSpec,
 )
 from .. import gates as G
+from ..replacement import FreezePolicy
 
 MODEL = "google/gemma-2-2b"
 MODEL_REV = "c5ebcd40d208330abc697524c919956e692655cf"
@@ -228,6 +230,28 @@ class GemmaScopeAdapter(ModelAdapter):
               "smoke corpus leaves 58x of float16 headroom, and TL's RMSNorm accumulates "
               "in float32.",
     )
+    #: Clause 8 (experiment 06).  gemma-2's SANDWICH NORM means four freezable
+    #: normalisations per block, not two: `ln1`/`ln2` scale the residual going
+    #: INTO each sublayer, `ln1_post`/`ln2_post` scale what comes out before it
+    #: is added back.  A frozen run that only froze the pre-norms would leave
+    #: half of gemma-2's normalisation recomputing on the corrupted stream and
+    #: still call itself frozen.  `final` is `ln_final`, at head time.
+    #:
+    #: NOTE on `ln2_post`: `hook_mlp_out` fires AFTER it (see the module
+    #: docstring's TAP section), so in any mode where the MLP output is REPLACED
+    #: the frozen `ln2_post` scale is applied to a value that is then discarded.
+    #: It is declared and frozen anyway — it is load-bearing in a frozen run with
+    #: the real MLP, which is the wiring control for this whole mechanism.
+    freeze_capabilities_spec = FreezeCapabilities(
+        attention=True,
+        ln_sites=("ln1", "ln1_post", "ln2", "ln2_post", "final"),
+        notes="TransformerLens exposes the post-softmax pattern at "
+              "`blocks.{L}.attn.hook_pattern` and every normalisation denominator at "
+              "`<norm>.hook_scale`; both hook outputs are CONSUMED by the next line of "
+              "the library's forward, which is what makes returning a cached tensor from "
+              "a forward hook an actual patch rather than a read. gemma-2 is sandwich-"
+              "normed, so all four block norms are freezable.",
+    )
     n_layers = N_LAYERS
     d_model = D_MODEL
     d_vocab = D_VOCAB
@@ -341,6 +365,128 @@ class GemmaScopeAdapter(ModelAdapter):
             block.hook_mlp_out.register_forward_hook(on_mlp_out),
         )
         return state, handles
+
+    # ------------------------------------------------- restore / freeze seam
+
+    def _norms(self, model, layer: int) -> dict:
+        """The block's normalisation modules, by the names the policy uses."""
+        b = model.blocks[layer]
+        out = {"ln1": b.ln1, "ln2": b.ln2}
+        # declared as present by `load_model`'s sandwich-norm assert, but read
+        # defensively: a future TL could rename them, and a silently-absent
+        # post-norm is exactly the half-frozen run this seam exists to prevent
+        for nm in ("ln1_post", "ln2_post"):
+            mod = getattr(b, nm, None)
+            if mod is None:
+                raise AttributeError(
+                    f"blocks[{layer}] has no {nm}: gemma-2's sandwich norm is what "
+                    f"`freeze_capabilities_spec` declares freezable, and it is missing")
+            out[nm] = mod
+        return out
+
+    def capture_tap(self, model, layer: int, cache, fires: dict | None = None):
+        """Read-only: record this layer's clean attention pattern and LN scales.
+
+        Every hook returns None, so the clean pass this runs inside is untouched
+        — the same discipline `tap(replace_fn=None)` follows.
+
+        NOTE ON `ln1`, measured not assumed.  TransformerLens applies `ln1`
+        SEPARATELY to the query, key and value inputs on a pre-norm block, so
+        `ln1.hook_scale` fires THREE times per block where the other norms fire
+        once.  All three calls receive the same tensor here (`use_split_qkv_input`
+        is off), so one cached scale is the right value for all three — but the
+        count is not one, and a freeze-efficacy check that assumed it was would
+        report a correct freeze as broken.  `fires` is how the caller learns the
+        real per-site call count from the clean run instead of guessing it.
+        """
+        L = int(layer)
+        state: dict = {}
+        handles = []
+
+        def on_pattern(mod, inputs, out):
+            cache.attn_pattern[L] = out.detach()
+            state["pattern"] = out
+            if fires is not None:
+                fires["attn_pattern"] = fires.get("attn_pattern", 0) + 1
+            return None
+
+        handles.append(model.blocks[L].attn.hook_pattern.register_forward_hook(on_pattern))
+        for name, norm in self._norms(model, L).items():
+            def on_scale(mod, inputs, out, _n=name):
+                cache.ln_scale[(L, _n)] = out.detach()
+                if fires is not None:
+                    fires[_n] = fires.get(_n, 0) + 1
+                return None
+
+            handles.append(norm.hook_scale.register_forward_hook(on_scale))
+        return state, tuple(handles)
+
+    def freeze_tap(self, model, layer: int, cache, policy: FreezePolicy,
+                   fires: dict | None = None):
+        """Write the clean run's pattern and scales back on a corrupted stream.
+
+        `fires` (optional) is a counter keyed by site, incremented every time a
+        freeze hook actually replaces a value — the evidence
+        `gates.check_freeze_efficacy` needs that the patch is not a no-op.
+        """
+        if not policy.freezes_forward:
+            return ()
+        self._check_freeze_supported(policy)
+        L = int(layer)
+        handles = []
+
+        if policy.attention:
+            frozen = cache.attn_pattern[L]
+
+            def on_pattern(mod, inputs, out, _p=frozen):
+                if fires is not None:
+                    fires["attn_pattern"] = fires.get("attn_pattern", 0) + 1
+                # dtype/device follow the LIVE value: TL casts the pattern to v's
+                # dtype on the next line anyway, and matching here keeps the
+                # frozen run's arithmetic identical to the recomputed one's
+                return _p.to(device=out.device, dtype=out.dtype)
+
+            handles.append(model.blocks[L].attn.hook_pattern.register_forward_hook(on_pattern))
+
+        if policy.layernorm:
+            for name, norm in self._norms(model, L).items():
+                key = (L, name)
+                if key not in cache.ln_scale:
+                    raise KeyError(f"no clean LN scale cached for {key}")
+
+                def on_scale(mod, inputs, out, _s=cache.ln_scale[key], _n=name):
+                    if fires is not None:
+                        fires[_n] = fires.get(_n, 0) + 1
+                    return _s.to(device=out.device, dtype=out.dtype)
+
+                handles.append(norm.hook_scale.register_forward_hook(on_scale))
+        return tuple(handles)
+
+    def final_norm_tap(self, model, cache, freeze: bool = False, fires: dict | None = None):
+        """Capture or restore `ln_final`'s scale, around the head.
+
+        The last normalisation is what decides how a corrupted final residual is
+        scaled before the unembed — the single most consequential scale in a
+        frozen run, and the one outside every block loop.
+        """
+        norm = model.ln_final
+
+        if not freeze:
+            def on_scale(mod, inputs, out):
+                cache.final_scale = out.detach()
+                return None
+        else:
+            if cache.final_scale is None:
+                raise KeyError(
+                    "no clean `ln_final` scale cached: capture it with "
+                    "`final_norm_tap(..., freeze=False)` around the CLEAN head first")
+
+            def on_scale(mod, inputs, out, _s=cache.final_scale):
+                if fires is not None:
+                    fires["final"] = fires.get("final", 0) + 1
+                return _s.to(device=out.device, dtype=out.dtype)
+
+        return (norm.hook_scale.register_forward_hook(on_scale),)
 
     # ------------------------------------------------------------------ gates
 
