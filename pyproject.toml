@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# ---------------------------------------------------------------------------
+# THE NAME LIVES IN EXACTLY TWO PLACES: `project.name` below and the package
+# directory `src/signoff/`.  Nothing inside the package hardcodes it — modules
+# read `signoff.TOOL_NAME`, which is derived from `__name__`.  A rename is
+# therefore: edit these two lines, `git mv src/signoff src/<new>`, done.
+# ---------------------------------------------------------------------------
+[project]
+name = "signoff"
+version = "0.1.0.dev0"
+description = "A faithfulness falsifier for interpretability artifacts: build the miter, hunt for divergence, report counterexamples."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["interpretability", "equivalence-checking", "sae", "transcoder", "falsification"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+# Everything needed to actually run an adapter against real weights.  The core
+# (metrics / stats / gates / report) is torch-only so CI can run it on CPU.
+adapters = [
+  "transformer-lens>=2.0",
+  "transformers>=4.40",
+  "huggingface-hub>=0.23",
+  "datasets>=2.19",
+  "safetensors>=0.4",
+  "numpy>=1.24",
+]
+dev = [
+  "pytest>=7",
+]
+
+[project.scripts]
+signoff = "signoff.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: needs real model weights / a GPU-class host; not part of the CPU CI subset",
+  "local_only: needs gated weights or >8 GB RAM; never runs on a shared runner",
+  "golden: golden-number regression against a completed experiment run",
+]

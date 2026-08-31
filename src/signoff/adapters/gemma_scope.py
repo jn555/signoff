@@ -1,0 +1,370 @@
+"""gemma-2-2b + gemma-scope width-16k JumpReLU transcoders.
+
+PROVENANCE.  Extracted from experiments/03-mechanism-and-validity/gemma_artifact.py
+and the driver in run_b_gemma.py.  That module is the model of what an adapter
+docstring owes the reader, and this one keeps its reasoning verbatim.
+
+--------------------------------------------------------------------- THE TAP
+The single most dangerous detail in this file.  From the release's own README
+(quoting Gemma Scope, arXiv:2408.05147v2 p.18): the transcoders are trained on
+"input activations just after the pre-MLP RMSNorm", with the norm GAIN FOLDED
+OUT, to reconstruct an `mlp_output` that is "after the post-MLP RMSNorm".  So:
+
+  INPUT  = x / rms(x), gain folded out.  In TransformerLens that is exactly
+           `blocks.L.ln2.hook_normalized`, because TL's RMSNorm fires
+           `hook_normalized` on `x/scale` BEFORE multiplying by `self.w`.
+           *** This is the OPPOSITE of the Qwen3/mwhanna artifact, where the
+           correct tap is the MLP module's own POST-gain input and
+           `ln2.hook_normalized` is explicitly the WRONG tap.  Same hook name,
+           opposite convention.  Gate (ii) is what catches a flip. ***
+
+  OUTPUT = the block's ADDITIVE contribution to the residual stream, i.e. AFTER
+           gemma-2's post-MLP RMSNorm ("sandwich" norm).  In TL that is
+           `blocks.L.hook_mlp_out`, fired after `ln2_post`.
+           *** Therefore the replacement must NOT be written at the `mlp`
+           module's output the way a Qwen-style adapter does — that value is
+           pre-ln2_post. ***
+
+------------------------------------------------------------------- SOFTCAP
+gemma-2 applies `30 * tanh(logits/30)` after the unembed.  `head()` reproduces
+it IN THE MODEL'S DTYPE, matching the library exactly.  Upcasting to float32
+before the softcap is *more accurate* and WRONG: in bfloat16 it disagrees by
+~2 ulp at |logit| ~ 20 — max|dlogit| 1.2e-1, base-vs-base KL 3.3e-3 — which is
+how this failed gate (i) the first time.  The base logits come from the
+library's forward and only the replaced logits from here; the two sides must
+use identical arithmetic or the difference between them is partly precision.
+
+----------------------------------------------------------------- SELECTION
+The SAELens registry lists one folder per layer, but it is simply the FIRST
+(lowest-L0) variant in the repo — for layers 11-22 that is L0 = 5..15, i.e.
+degenerate near-empty dictionaries.  Gemma Scope's own "canonical" convention
+is instead the variant whose average L0 is CLOSEST TO 100.  That rule
+reproduces all 78 `*-canonical` registry entries for gemma-2-2b exactly
+(verified, 0 mismatches).  `CANONICAL_L0` freezes the result and
+`verify_provenance()` re-derives it from the live listing and HALTS on drift.
+
+--------------------------------------------------------------------- DTYPE
+float16 — MEASURED, and the a-priori reasoning that pointed at bfloat16 was
+wrong.  The worry was range (gemma-2 is bfloat16-trained, float16 caps at
+65504); measured, the residual stream peaks at |resid|max = 1123 over the smoke
+corpus (58x headroom) and TL's RMSNorm accumulates in float32, so the overflow
+path never opens.  PRECISION is the binding constraint, on gate (iii):
+
+    dtype      replaced KL max   base KL max    (tolerance 1e-2 nats)
+    bfloat16      3.09e-01         3.82e-02     FAIL
+    float16       5.85e-04         2.02e-03     PASS
+
+The base column is the tell: it carries no transcoders, so its error is pure
+dtype.  bfloat16 alone would have injected ~4x the tolerance into every KL.
+
+------------------------------------------------------------------------ BOS
+gemma-scope trained on BOS-prefixed sequences and excluded the BOS POSITION
+from activation collection (arXiv:2408.05147v2); SAELens' loader sets
+`prepend_bos: True`.  Feeding a raw 64-token slice with no BOS is badly
+off-distribution: measured on 16 windows, base NLL falls 7.005 -> 3.217
+nats/token (perplexity 1102 -> 25) purely from prepending BOS.
+
+TIER: local-only.  26 layers x 302 MB of transcoder weights = 7.85 GB, and the
+gate (iii) float32 arm is ~13 GB of model on CPU.  It fits a 16 GB laptop-class
+host only because the stages are never co-resident.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Callable
+
+import torch
+
+from .base import (
+    Dictionary,
+    DtypePolicy,
+    Identity,
+    ModelAdapter,
+    TapSpec,
+    TokenizationSpec,
+)
+from .. import gates as G
+
+MODEL = "google/gemma-2-2b"
+MODEL_REV = "c5ebcd40d208330abc697524c919956e692655cf"
+TC_REPO = "google/gemma-scope-2b-pt-transcoders"
+TC_REV = "50eec2f25c60545a9a74c1c3a26a0afdd0b4b872"
+WIDTH = "width_16k"
+
+N_LAYERS = 26
+D_MODEL = 2304
+D_SAE = 16384
+D_VOCAB = 256000
+LOGIT_SOFTCAP = 30.0
+BOS_ID = 2  # declared; verified against the tokenizer on first use
+
+#: Frozen "closest to L0=100" selection (tie -> smaller L0), one per layer.
+#: Regenerated by `discover_canonical_l0()`; a mismatch means the repo changed
+#: and the run must STOP rather than silently use different dictionaries.
+CANONICAL_L0 = {
+    0: 115, 1: 104, 2: 87, 3: 96, 4: 88, 5: 87, 6: 95, 7: 70, 8: 92,
+    9: 72, 10: 88, 11: 108, 12: 111, 13: 89, 14: 81, 15: 78, 16: 87,
+    17: 112, 18: 99, 19: 89, 20: 88, 21: 102, 22: 117, 23: 116, 24: 96,
+    25: 110,
+}
+
+#: 302 MB each (float32 npz); 26 layers -> 7.85 GB.
+TC_BYTES_EACH = 302_131_416
+
+
+def tc_path(layer: int) -> str:
+    return f"layer_{layer}/{WIDTH}/average_l0_{CANONICAL_L0[layer]}/params.npz"
+
+
+def discover_canonical_l0() -> dict[int, int]:
+    """Re-derive the canonical selection from the live repo listing.  Network only."""
+    from huggingface_hub import HfApi
+
+    files = HfApi().list_repo_files(TC_REPO, revision=TC_REV)
+    opts: dict[int, list[int]] = {}
+    for f in files:
+        m = re.match(rf"layer_(\d+)/{WIDTH}/average_l0_(\d+)/params\.npz$", f)
+        if m:
+            opts.setdefault(int(m.group(1)), []).append(int(m.group(2)))
+    return {L: min(sorted(v), key=lambda x: (abs(x - 100), x)) for L, v in opts.items()}
+
+
+class JumpReLUTranscoder(Dictionary):
+    """`(h * (h > threshold)) @ W_dec + b_dec`, with `h = x @ W_enc + b_enc`.
+
+    Checkpoint layout, verified against the downloaded params.npz (clause 7):
+        W_enc     (d_in=2304, d_sae=16384)  float32  <- already (d_in, d_sae),
+                                                       NOT transposed on load
+                                                       (unlike the mwhanna
+                                                       release, which stores
+                                                       (d_sae, d_in))
+        W_dec     (d_sae, d_out=2304)       float32
+        b_enc     (d_sae,)                  float32
+        b_dec     (d_out,)                  float32
+        threshold (d_sae,)                  float32  <- JumpReLU, all > 0
+                                                       (observed min 0.0916)
+
+    SAELens' JumpReLU computes `relu(h) * (h > threshold)`; since every
+    threshold is strictly positive that is identical to `h * (h > threshold)`.
+    `apply_b_dec_to_input` is False for this release, so there is NO input
+    pre-bias (the Dunefsky transcoders have one).
+    """
+
+    def __init__(self, layer: int, sd: dict, device, dtype, chunk: int = 256):
+        self.layer = layer
+        self.chunk = chunk
+        self.dtype = dtype
+        self.W_enc = sd["W_enc"].to(device, dtype)
+        self.b_enc = sd["b_enc"].to(device, dtype)
+        self.W_dec = sd["W_dec"].to(device, dtype)
+        self.b_dec = sd["b_dec"].to(device, dtype)
+        self.threshold = sd["threshold"].to(device, dtype)
+        assert self.W_enc.shape == (D_MODEL, D_SAE), self.W_enc.shape
+        assert self.W_dec.shape == (D_SAE, D_MODEL), self.W_dec.shape
+        assert self.b_enc.shape == (D_SAE,), self.b_enc.shape
+        assert self.b_dec.shape == (D_MODEL,), self.b_dec.shape
+        assert self.threshold.shape == (D_SAE,), self.threshold.shape
+        assert float(self.threshold.min()) > 0, "JumpReLU threshold must be positive"
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        sh = x.shape
+        xf = x.reshape(-1, sh[-1]).to(self.dtype)
+        out = torch.empty(xf.shape[0], self.W_dec.shape[1], device=xf.device, dtype=self.dtype)
+        for s in range(0, xf.shape[0], self.chunk):
+            e = min(s + self.chunk, xf.shape[0])
+            h = xf[s:e] @ self.W_enc + self.b_enc
+            acts = h * (h > self.threshold)          # JumpReLU
+            out[s:e] = acts @ self.W_dec + self.b_dec
+            del h, acts
+        return out.reshape(sh).to(x.dtype)
+
+
+class GemmaScopeAdapter(ModelAdapter):
+    """gemma-2-2b with its 26 MLP sublayers replaceable by gemma-scope transcoders."""
+
+    name = "gemma-scope-2b"
+
+    identity = Identity(
+        release="gemma-2-2b+gemma-scope-2b-pt-transcoders(width_16k, canonical)",
+        model_repo=MODEL, model_revision=MODEL_REV,
+        dict_repo=TC_REPO, dict_revision=TC_REV,
+        notes="Canonical variant = average L0 closest to 100 (tie -> smaller L0), which "
+              "reproduces all 78 `*-canonical` SAELens entries for gemma-2-2b exactly. "
+              "The registry's own per-layer entry is the LOWEST-L0 variant and is "
+              "degenerate for layers 11-22.",
+    )
+    taps = TapSpec(
+        input_hook="blocks.{L}.ln2.hook_normalized",
+        output_hook="blocks.{L}.hook_mlp_out",
+        input_convention="PRE-GAIN normalised MLP input, x/rms(x) with the RMSNorm gain "
+                         "folded out — TL fires hook_normalized before multiplying by w, "
+                         "so this holds under both from_pretrained_no_processing and "
+                         "from_pretrained+fold_ln",
+        output_convention="the block's additive contribution to the residual stream, AFTER "
+                          "gemma-2's post-MLP RMSNorm (ln2_post) — NOT the mlp module's "
+                          "own return value",
+        notes="THE TAP TRAP. The mwhanna/Qwen release uses the same hook NAME with the "
+              "opposite gain convention, and gemma-2's sandwich norm moves the write "
+              "point. A flip of either reads FVU ~ 1 at every layer (gate (ii)).",
+    )
+    tokenization = TokenizationSpec(
+        bos_id=BOS_ID, declared=True, exclude_position_0=True,
+        notes="gemma-scope trained on BOS-prefixed sequences and excluded the BOS position "
+              "(arXiv:2408.05147v2). Measured: BOS-free eval moves corpus NLL "
+              "7.005 -> 3.217 nats/token and d_mean by ~12%.",
+    )
+    dtype_policy = DtypePolicy(
+        default="float16",
+        allowed=("float32", "float16", "bfloat16"),
+        measured={
+            "float16": "gate (iii): replaced KL max 5.85e-04, base 2.02e-03 — PASS",
+            "bfloat16": "gate (iii): replaced KL max 3.09e-01, base 3.82e-02 — FAIL "
+                        "(~4x the tolerance injected into every KL)",
+            "float32": "~13 GB on CPU in TransformerLens (W_E and W_U are separate copies)",
+        },
+        notes="Precision, not range, is the binding constraint: |resid|max = 1123 over the "
+              "smoke corpus leaves 58x of float16 headroom, and TL's RMSNorm accumulates "
+              "in float32.",
+    )
+    n_layers = N_LAYERS
+    d_model = D_MODEL
+    d_vocab = D_VOCAB
+
+    def __init__(self, device=None, dtype=None, tc_chunk: int = 256):
+        super().__init__(device=device, dtype=dtype)
+        self.tc_chunk = int(tc_chunk)
+
+    # ---------------------------------------------------------------- loading
+
+    def tokenizer(self):
+        if self._tok is None:
+            from transformers import AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REV)
+            # declared, then VERIFIED — clause 3 is not a comment
+            assert tok.bos_token_id == BOS_ID, (tok.bos_token_id, BOS_ID)
+            self._tok = tok
+        return self._tok
+
+    def load_model(self, device, dtype):
+        """`from_pretrained_no_processing`: gemma-2's `output_logits_soft_cap=30`
+        makes TL raise on the default `center_unembed=True`, and no_processing
+        keeps the model bit-faithful to HF gemma-2 while leaving
+        `ln2.hook_normalized` pre-gain — which is the tap we want."""
+        from transformer_lens import HookedTransformer
+
+        try:
+            m = HookedTransformer.from_pretrained_no_processing(
+                MODEL, device=device, dtype=dtype, revision=MODEL_REV)
+        except TypeError:
+            # `revision` rides in **from_pretrained_kwargs and is not accepted by
+            # every TL version; fall back to the cached default rather than dying
+            m = HookedTransformer.from_pretrained_no_processing(
+                MODEL, device=device, dtype=dtype)
+        m.eval()
+        cfg = m.cfg
+        assert cfg.n_layers == N_LAYERS, (cfg.n_layers, N_LAYERS)
+        assert cfg.d_model == D_MODEL, (cfg.d_model, D_MODEL)
+        assert cfg.d_vocab == D_VOCAB, (cfg.d_vocab, D_VOCAB)
+        # the structural facts the taps depend on
+        assert cfg.use_normalization_before_and_after, "gemma-2 sandwich norm expected"
+        assert cfg.normalization_type == "RMS", cfg.normalization_type
+        assert float(cfg.output_logits_soft_cap or 0) == LOGIT_SOFTCAP, \
+            cfg.output_logits_soft_cap
+        assert cfg.positional_embedding_type == "rotary", cfg.positional_embedding_type
+        assert not cfg.post_embedding_ln
+        # ln2 must still carry its gain -- that is what makes ln2.hook_normalized
+        # the PRE-GAIN value the transcoders were trained on
+        assert hasattr(m.blocks[0].ln2, "w"), "ln2 has no gain: model was loaded folded"
+        assert hasattr(m.blocks[0], "ln2_post"), "no ln2_post: sandwich norm missing"
+        return m
+
+    def load_dictionary(self, layer: int, device, dtype) -> JumpReLUTranscoder:
+        import numpy as np
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(TC_REPO, tc_path(layer), revision=TC_REV)
+        z = np.load(path)
+        sd = {k: torch.from_numpy(z[k])
+              for k in ("W_enc", "W_dec", "b_enc", "b_dec", "threshold")}
+        tc = JumpReLUTranscoder(layer, sd, device, dtype, chunk=self.tc_chunk)
+        del sd, z
+        return tc
+
+    # ------------------------------------------------------------- primitives
+
+    def embed(self, model, toks):
+        """Rotary-only; gemma's sqrt(d_model) embedding scale is folded into W_E."""
+        return model.embed(toks)
+
+    def block(self, model, layer: int, resid):
+        return model.blocks[layer](resid)
+
+    def head(self, model, resid):
+        """Clause 5.  Softcap IN THE MODEL DTYPE — see the module docstring.
+
+        The library does
+            logits = unembed(ln_final(residual))     # still cfg.dtype
+            logits = cap * tanh(logits / cap)        # Python-float cap
+        so the whole tanh runs in the model's dtype and is rounded back to it.
+        Upcasting first is more accurate and does not match.
+        """
+        logits = model.unembed(model.ln_final(resid))
+        logits = LOGIT_SOFTCAP * torch.tanh(logits / LOGIT_SOFTCAP)
+        return logits.float()
+
+    def tap(self, model, layer: int, replace_fn: Callable | None = None):
+        """Read at `ln2.hook_normalized` (pre-gain), write at `hook_mlp_out`.
+
+        state["x"] is float32 because TL's RMSNorm computes in float32 and fires
+        `hook_normalized` before casting back to cfg.dtype.
+        """
+        block = model.blocks[layer]
+        state: dict = {}
+
+        def on_norm(mod, inputs, out):
+            state["x"] = out
+            return None
+
+        def on_mlp_out(mod, inputs, out):
+            state["y"] = out
+            if replace_fn is None:
+                return None
+            yhat = replace_fn(state["x"], out).to(out.dtype)
+            state["yhat"] = yhat
+            return yhat
+
+        handles = (
+            block.ln2.hook_normalized.register_forward_hook(on_norm),
+            block.hook_mlp_out.register_forward_hook(on_mlp_out),
+        )
+        return state, handles
+
+    # ------------------------------------------------------------------ gates
+
+    def verify_provenance(self) -> G.GateResult:
+        """Clause 1: re-derive the canonical selection and halt on drift.
+
+        This gate is the reason the run does not silently audit a different set
+        of dictionaries than the one it claims.
+        """
+        try:
+            observed = discover_canonical_l0()
+        except Exception as e:
+            spec = G.GATE_SPECS["provenance-freeze"]
+            return G.GateResult(
+                spec, G.UNRUN, None, None,
+                f"could not list {TC_REPO}@{TC_REV[:8]} ({type(e).__name__}); the frozen "
+                f"selection could not be re-derived, so it is UNVERIFIED",
+                dict(error=str(e)))
+        return G.check_provenance_freeze(CANONICAL_L0, observed,
+                                         what="canonical-L0 variant selection")
+
+    def l0_of(self, layer: int) -> int:
+        return CANONICAL_L0[layer]
+
+
+def gemma_scope_2b(device=None, dtype=None, **kw) -> GemmaScopeAdapter:
+    return GemmaScopeAdapter(device=device, dtype=dtype, **kw)
