@@ -43,6 +43,12 @@ _REGISTRY: dict[str, tuple[str, str, str, str]] = {
         "Qwen3-0.6B + mwhanna low-L0 ReLU transcoders (28 layers, float16)",
         "local",
     ),
+    "llama32-clt-mntss": (
+        "llama_clt", "llama32_clt_mntss",
+        "Llama-3.2-1B + mntss CROSS-LAYER transcoder, the circuit-tracer artifact "
+        "(16 layers x 32768 features, JumpReLU, no skip, float32)",
+        "local",
+    ),
     "toy": (
         "toy", "toy",
         "SYNTHETIC fixture — a deterministic 4-layer toy artifact. Not a model; it "
@@ -54,7 +60,7 @@ _REGISTRY: dict[str, tuple[str, str, str, str]] = {
 __all__ = [
     "ModelAdapter", "Identity", "TapSpec", "TokenizationSpec", "DtypePolicy",
     "Dictionary", "pick_device", "get", "available", "describe",
-    "gpt2_dunefsky", "gemma_scope_2b", "qwen3_mwhanna", "toy",
+    "gpt2_dunefsky", "gemma_scope_2b", "qwen3_mwhanna", "llama32_clt_mntss", "toy",
 ]
 
 

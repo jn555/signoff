@@ -21,12 +21,15 @@ model".
 
 ```
 python -m unittest discover -s tests
-Ran 174 tests — OK (3 skipped)
+Ran 203 tests — OK (5 skipped)
 ```
 
 - 3 skips are the gemma-scope / Qwen gate tests, which need 7.85 GB and 18.8 GB
   of local weights. They are skipped in the CPU suite but **have now been run**
   under `SIGNOFF_LOCAL=1` — see §4.
+- 2 skips are the new Llama CLT gate tests, which are blocked on a gated model
+  repo and 20.4 GB of dictionary — see §6. Its cross-layer forward and its
+  cross-layer FVU ARE covered in the CPU suite, on the toy fixture.
 - The suite runs in ~7 s on CPU with no network, including the golden regression.
 - Executed with `../experiments/01-divergence-witnesses/.venv/bin/python`.
   That venv has no `pytest`, so tests are written on `unittest` and run under
@@ -132,25 +135,71 @@ checkpoints only, plus the (b,c,r,s,k) coverage emitter behind `--coverage`.
 `signoff audit --adapter toy` runs the whole pipeline gated, on CPU, with no
 network.
 
-## Next milestone — v0.1.1 (promoted from v0.2 by demand review)
+## 6. v0.1.1 — CLT adapter for the circuit-tracer stack. BUILT, weight-BLOCKED.
 
-**CLT / attribution-graph adapter for the circuit-tracer stack** (the Gemma CLTs
-used by the open circuit-tracer / Neuronpedia). This is the artifact generation
-the growing user base actually produces, so it outranks everything else below.
+`adapters/llama_clt.py` (`llama32-clt-mntss`): **Llama-3.2-1B +
+`mntss/clt-llama-3.2-1b-524k`**, the cross-layer transcoder the open
+circuit-tracer stack ships. Full seven-clause contract; 29 tests in
+`tests/test_llama_clt.py`. **The seam held — nothing in the runner, metrics,
+gates or report changed.**
 
-**The seam is already in place** — this was designed in, not deferred:
-- `SubstitutionPlan` owns the substituted forward; the adapter chooses it via
-  `ModelAdapter.substitution_plan(spec)`. `PerLayerPlan` is v0.1's; a
-  cross-layer plan needs no change to the runner, metrics, gates or report.
-- A `Site` is `(read_layer, write_layer)`, not a layer index, and renders as
-  `"3->7"`.
-- Gate (ii) is keyed by **site**, not by layer, and accepts cross-layer ids.
-- Tested in `tests/test_adapter_contract.py::TestCrossLayerSeam` with a real
-  adapter subclass that overrides the plan.
+Investigated 2026-08-31 against the released source and the released checkpoint
+headers, all cited in the adapter's provenance docstring. Findings that matter
+beyond this adapter:
 
-Remaining work for that adapter is the artifact itself: CLT weight layout and
-loading, the read-once/write-many forward, per-site FVU accumulation across
-multiple write targets, and its own provenance freeze.
+- **The repo MOVED.** `safety-research/circuit-tracer` now 301-redirects to
+  **`decoderesearch/circuit-tracer`** (pinned at `6018ed8d`).
+- **Both artifact families exist per model**, PLT *and* CLT, sharing the same
+  hooks (`hook_resid_mid` -> `hook_mlp_out`). For Llama-3.2-1B the PLT
+  (`mntss/transcoder-Llama-3.2-1B`) is ReLU **with** a skip connection
+  (`W_skip` in its checkpoints); the CLT is JumpReLU with **no** skip.
+- **A THIRD tap convention.** This artifact reads `hook_resid_mid` — the RAW,
+  un-normalised residual stream. gemma-scope reads the PRE-gain normalised
+  input and qwen3-mwhanna the POST-gain one. Three meanings, two hook names.
+  A CI test asserts all three stay distinct.
+- **Prefix-faithfulness.** `recon_W = b_dec_W + SUM_{L<=W} a_L W_dec_L[:,W-L,:]`,
+  so a partial run reproduces the artifact **iff the layer set is a prefix
+  `{0..k}`**. `run_tag` stamps `clt=prefix` or `clt=truncated`; a truncated set
+  is allowed (localisation profiles need it) but never silently.
+- **FVU is per WRITE layer, not per site.** A CLT gives a write layer one target
+  and many read sites, so there is no per-`(read, write)` residual. Keys name
+  the bundle (`"0..2->2"`); gate (ii) takes them unchanged.
+- Four base measurement methods are overridden (`substitution_plan`,
+  `measure_fvu`, `verify_provenance`, `run_tag`), so four gate rows print
+  `[self-reported]`. Each override is argued in the docstring; `run_tag`'s
+  buys two of those marks in exchange for not hiding the prefix/truncated
+  distinction.
+
+**Gates run so far.** `verify_provenance()` **PASSES against the live release**
+(36 frozen entries: the `config.yaml` hook declaration plus the 32-file
+inventory) — the CLT repo is ungated, so this is a real gate on the real
+artifact, no weights. Gates (i)/(ii)/(iii) have **not** run: two blockers.
+
+1. `meta-llama/Llama-3.2-1B` is **gated** (`gated: manual`); this host's HF
+   token gets a `GatedRepoError 403` on even `config.json`. Access must be
+   granted on HF before any model-touching gate can run.
+2. The dictionary is **20.4 GB** (2.15 GB of encoders + 18.25 GB of decoders)
+   against ~10 GB of free disk. The adapter is built for this: it slices
+   individual decoder PLANES out of the safetensors files, so the smallest
+   faithful cross-layer smoke — prefix `{0,1}` — is 0.67 GB resident in bf16
+   (4.43 GB on disk) plus ~2.5 GB of model.
+
+The cross-layer code is *not* untested for it: `CrossLayerPlan` and the
+cross-layer `measure_fvu` run in the CPU suite against the toy fixture, where
+a CLT with zeroed off-diagonal planes is checked to reduce **exactly** to
+`PerLayerPlan`, a non-zero plane is checked to actually change the answer,
+adding a read layer is checked not to move any write layer above it, and the
+FVU the gate reports is checked to be the reconstruction the forward writes.
+
+## Next milestone
+
+Weight-verify `llama32-clt-mntss` — the only thing standing between it and a
+full gate run is (a) HF access to `meta-llama/Llama-3.2-1B` and (b) ~7 GB of
+free disk for the prefix-`{0,1}` smoke. Do those two and
+`SIGNOFF_LOCAL=1 python -m unittest tests.test_llama_clt` runs gates (i) and
+(ii) on the real artifact. A `mntss/transcoder-Llama-3.2-1B` PLT adapter (same
+model, same hooks, ReLU **with** skip) would then share the model download and
+give the CLT a per-layer control on the identical stack.
 
 ## Not built (deferred, with reasons)
 
