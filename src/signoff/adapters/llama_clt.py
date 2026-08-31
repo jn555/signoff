@@ -637,7 +637,9 @@ class LlamaCltAdapter(ModelAdapter):
             "this model has a post-MLP norm; the CLT's write point would be wrong"
         assert not cfg.parallel_attn_mlp, \
             "parallel attn/mlp: there is no hook_resid_mid to read"
-        assert not float(cfg.output_logits_soft_cap or 0), cfg.output_logits_soft_cap
+        # TL encodes "no softcap" as 0 or -1 depending on version; only a
+        # POSITIVE value means an active cap (gemma-2 uses 30.0)
+        assert float(cfg.output_logits_soft_cap or 0) <= 0, cfg.output_logits_soft_cap
         assert not cfg.post_embedding_ln
         # unfolded, or the tap moved out from under us
         assert hasattr(m.blocks[0].ln2, "w"), \

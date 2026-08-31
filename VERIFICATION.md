@@ -15,3 +15,9 @@ orchestrating session on 2026-08-31 (raw unittest output; host: M4 MacBook Air
   regression, ≤6.9e-5 nats vs committed exp-01 values).
 
 STATUS.md §4 summarizes; this file is the underlying record.
+
+- **Llama-3.2-1B + mntss CLT (cross-layer, prefix {0,1} smoke)**
+  (`TestLlamaCltGates`, 2 tests): `Ran 2 tests in 244.236s — OK` on 2026-08-31
+  (gates i+ii on real weights + CLT decoder slices; live provenance match). Note:
+  first run failed on an adapter guard that treated TL's "no softcap" sentinel
+  (-1.0) as an active cap — guard corrected (positive-only), gates then passed.
