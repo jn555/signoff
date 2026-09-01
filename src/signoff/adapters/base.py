@@ -364,6 +364,41 @@ class ModelAdapter:
     def embed(self, model, toks: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def token_embedding_matrix(self, model) -> torch.Tensor:
+        """OPTIONAL, for the GRADIENT ORACLE.  The `(d_vocab, d_model)` table.
+
+        Only a gradient-guided miner needs this: it is what turns a token id
+        into a differentiable one-hot coordinate (`gradients.py`).  An adapter
+        that does not supply it simply cannot host a GCG-style search, and says
+        so rather than silently guessing which parameter is the embedding.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose its token-embedding matrix; a "
+            f"gradient-guided miner needs one (see adapters/base.py::"
+            f"token_embedding_matrix and gradients.py)")
+
+    def embed_from_onehot(self, model, onehot: torch.Tensor,
+                          toks: torch.Tensor) -> torch.Tensor:
+        """DIFFERENTIABLE `embed`, with the token lookup written as a matmul.
+
+        `onehot` is `(B, T, d_vocab)` and carries the graph; `toks` is the same
+        thing as ids and is used ONLY for the parts of the embedding that do not
+        depend on the token identity (absolute positions, and anything else the
+        adapter's `embed` adds).
+
+        The default assumes the embedding is ADDITIVE in the token embedding —
+        `embed(toks) == W_E[toks] + f(positions)` — which is true of GPT-2 and of
+        every rotary model (where `f` is zero), and false of any model that
+        SCALES the token embedding (gemma-2 multiplies by sqrt(d_model)); such an
+        adapter must override this.  `gradients.py` checks the reconstruction
+        against `embed()` on the real tokens before any search runs, so a wrong
+        default is caught loudly rather than quietly steering a search.
+        """
+        W_E = self.token_embedding_matrix(model)
+        with torch.no_grad():
+            positional = self.embed(model, toks) - W_E[toks]
+        return onehot.to(W_E.dtype) @ W_E + positional
+
     def block(self, model, layer: int, resid: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 

@@ -125,6 +125,92 @@ class TestGreedySearch(unittest.TestCase):
         self.assertEqual(src.count("uniform"), 5)
 
 
+def disagreeing_evaluate(mean_token: int = 3, max_token: int = 7, vocab: int = 32):
+    """d_mean and d_max climb on DIFFERENT tokens, so the two objectives are
+    distinguishable: a search can only look good on the metric it targeted."""
+
+    def evaluate(batch: torch.Tensor):
+        hits_mean = (batch == mean_token).float().sum(-1)
+        hits_max = (batch == max_token).float().sum(-1)
+        d_mean = 0.1 + 0.5 * hits_mean
+        d_max = 0.1 + 0.5 * hits_max
+        nll = 2.0 + 0.5 * (hits_mean + hits_max)
+        lb = torch.zeros(batch.shape[0], batch.shape[1], vocab)
+        return lb, SeqMetrics(d_mean, d_max, torch.zeros_like(d_mean), nll)
+
+    return evaluate
+
+
+class TestObjectiveMetric(unittest.TestCase):
+    """The d_max objective option (added for experiment 09's preregistered arm)."""
+
+    def setUp(self):
+        self.seed_tokens = torch.zeros(12, dtype=torch.long)
+
+    def test_default_is_the_extracted_d_mean_search(self):
+        m = Mine.GreedyMiner(iters=4, cands=8, seed=0)
+        self.assertEqual(m.objective_metric, "d_mean")
+        self.assertEqual(m.name_full, "greedy")
+        r = m.search(seed_tokens=self.seed_tokens, evaluate=fake_evaluate(),
+                     d_vocab=32, nll_ceiling=99.0, lam=0.0)
+        self.assertEqual(r.miner, "greedy")
+        self.assertEqual(r.params["objective_metric"], "d_mean")
+
+    def test_unknown_objective_metric_is_refused(self):
+        with self.assertRaises(ValueError):
+            Mine.GreedyMiner(objective_metric="flip")
+
+    def test_d_max_objective_climbs_d_max_not_d_mean(self):
+        ev = disagreeing_evaluate()
+        r_max = Mine.GreedyMiner(iters=25, cands=16, seed=0,
+                                 objective_metric="d_max").search(
+            seed_tokens=self.seed_tokens, evaluate=ev, d_vocab=32,
+            nll_ceiling=99.0, lam=0.0)
+        r_mean = Mine.GreedyMiner(iters=25, cands=16, seed=0).search(
+            seed_tokens=self.seed_tokens, evaluate=ev, d_vocab=32,
+            nll_ceiling=99.0, lam=0.0)
+        # each arm moves its own metric...
+        self.assertGreater(r_max.d_max, r_max.seed_d_max)
+        self.assertGreater(r_mean.d_mean, r_mean.seed_d_mean)
+        # ...and beats the other arm ON that metric
+        self.assertGreater(r_max.d_max, r_mean.d_max)
+        self.assertGreater(r_mean.d_mean, r_max.d_mean)
+
+    def test_d_max_arm_respects_the_perplexity_hinge(self):
+        ev = disagreeing_evaluate()
+        free = Mine.GreedyMiner(iters=20, cands=16, seed=0,
+                                objective_metric="d_max").search(
+            seed_tokens=self.seed_tokens, evaluate=ev, d_vocab=32,
+            nll_ceiling=2.5, arm="unconstrained", lam=0.0)
+        tied = Mine.GreedyMiner(iters=20, cands=16, seed=0,
+                                objective_metric="d_max").search(
+            seed_tokens=self.seed_tokens, evaluate=ev, d_vocab=32,
+            nll_ceiling=2.5, arm="constrained", lam=5.0)
+        self.assertLessEqual(tied.d_max, free.d_max)
+        self.assertLess(tied.nll, free.nll)
+
+    def test_d_max_arm_is_distinguishable_in_the_record(self):
+        r = Mine.GreedyMiner(iters=3, cands=4, seed=0,
+                             objective_metric="d_max").search(
+            seed_tokens=self.seed_tokens, evaluate=fake_evaluate(), d_vocab=32,
+            nll_ceiling=99.0, lam=0.0)
+        self.assertEqual(r.miner, "greedy[d_max]")
+        self.assertEqual(r.params["objective_metric"], "d_max")
+        d = r.to_dict()
+        self.assertIn("seed_d_max", d)
+        self.assertEqual(d["seed_d_max"], r.seed_d_max)
+        # the trajectory now carries d_max at the seed and at every iteration
+        self.assertTrue(all("d_max" in t for t in r.trajectory))
+
+    def test_d_max_objective_is_deterministic_under_seed(self):
+        kw = dict(seed_tokens=self.seed_tokens, evaluate=disagreeing_evaluate(),
+                  d_vocab=32, nll_ceiling=10.0, lam=0.0)
+        a = Mine.GreedyMiner(iters=6, cands=8, seed=3, objective_metric="d_max").search(**kw)
+        b = Mine.GreedyMiner(iters=6, cands=8, seed=3, objective_metric="d_max").search(**kw)
+        self.assertEqual(a.tokens, b.tokens)
+        self.assertEqual(a.d_max, b.d_max)
+
+
 class TestSeedSelection(unittest.TestCase):
     def test_interleaves_tail_and_median_seeds(self):
         rows = [dict(row=i, d_mean=float(i), nll=1.0) for i in range(20)]

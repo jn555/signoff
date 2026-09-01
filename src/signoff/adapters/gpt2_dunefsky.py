@@ -101,8 +101,17 @@ class Transcoder(Dictionary):
             self.b_dec_out.to(device, dtype),
         )
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """NOT `@torch.no_grad()` — deliberately, since the gradient oracle.
+
+        Every MEASUREMENT caller reaches this from inside an outer `no_grad`
+        (`PerLayerPlan.replaced_logits`, `capture_clean_run`, `measure_fvu` are
+        all decorated), so dropping the decorator changes no scoring path's
+        memory profile.  What it does change: a GCG-style miner needs the
+        substituted forward to be differentiable end to end, and a `no_grad`
+        decorator HERE severs the graph at the dictionary — the search would
+        then be steered by the skip connections alone, silently.
+        """
         acts = F.relu((x - self.b_dec) @ self.W_enc + self.b_enc)
         return acts @ self.W_dec + self.b_dec_out
 
@@ -231,6 +240,12 @@ class Gpt2DunefskyAdapter(ModelAdapter):
         """GPT-2 uses LEARNED ABSOLUTE positional embeddings: they must be added
         here, or the layer-major pass is a different model and gate (i) fails."""
         return model.embed(toks) + model.pos_embed(toks, 0)
+
+    def token_embedding_matrix(self, model) -> torch.Tensor:
+        """`W_E`, (50257, 768).  GPT-2's embedding is additive in it, so the
+        base class's `embed_from_onehot` is exact here — and `gradients.py`
+        checks that against `embed()` before a search starts."""
+        return model.W_E
 
     def block(self, model, layer: int, resid: torch.Tensor) -> torch.Tensor:
         return model.blocks[layer](resid)

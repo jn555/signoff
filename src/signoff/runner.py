@@ -453,7 +453,14 @@ class Runner:
     def search(self, *, miner=None, n_tail: int = 5, n_median: int = 5,
                iters: int = 20, cands: int = 32, lam: float = 2.0,
                fresh: bool = False) -> list[dict]:
-        """Constrained + unconstrained greedy arms from tail and median seeds."""
+        """Constrained + unconstrained arms from tail and median seeds.
+
+        `miner` defaults to `GreedyMiner`; any `Miner` works, and a
+        gradient-guided one carries its own oracle (`gradients.gradient_fn`)
+        because nothing about a search budget or a seed set changes when the
+        proposal distribution does — which is exactly what makes swapping the
+        miner a controlled comparison.
+        """
         if not self.rows:
             raise RuntimeError("nothing scored yet: call score() before search()")
         miner = miner or Mine.GreedyMiner(iters=iters, cands=cands, lam=lam, seed=self.seed)

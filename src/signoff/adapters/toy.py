@@ -106,8 +106,10 @@ class _ToyDictionary(Dictionary):
         self.noise = torch.randn(D_MODEL, D_MODEL, generator=g) * scale
         self.bias = torch.randn(D_MODEL, generator=g) * scale * 0.1
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # NOT no_grad, for the same reason as the real transcoder: every
+        # measurement caller is already inside one, and the gradient oracle
+        # needs the substituted forward to be differentiable through here.
         y = self.block.sublayer(x)
         return y + y @ self.noise + self.bias
 
@@ -177,6 +179,12 @@ class ToyAdapter(ModelAdapter):
 
     def embed(self, model, toks):
         return model.embed(toks)
+
+    def token_embedding_matrix(self, model):
+        """The fixture's embedding is `W_E[toks] + W_pos[:T]` — additive, so the
+        base class's one-hot reconstruction is exact.  Present so the gradient
+        oracle is testable on a CPU with no weights."""
+        return model.W_E
 
     def block(self, model, layer: int, resid):
         return model.blocks[layer](resid)
